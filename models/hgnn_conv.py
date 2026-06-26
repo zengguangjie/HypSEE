@@ -4,6 +4,21 @@ import torch.nn.functional as F
 
 EPS = 1e-8
 
+
+def _assert_finite(name: str, tensor: torch.Tensor) -> None:
+    if torch.isfinite(tensor).all():
+        return
+    nan_count = int(torch.isnan(tensor).sum())
+    inf_count = int(torch.isinf(tensor).sum())
+    finite = tensor[torch.isfinite(tensor)]
+    stat = (
+        f"min={finite.min().item():.4g}, max={finite.max().item():.4g}"
+        if finite.numel() > 0 else "no finite values"
+    )
+    raise AssertionError(
+        f"{name}: shape={tuple(tensor.shape)}, nan={nan_count}, inf={inf_count}, {stat}"
+    )
+
 class HGNNConvDense(nn.Module):
     def __init__(self, in_channels, out_channels, bias=True, use_bn=False, drop_rate=0.5, is_last=False, sym_D=False):
         super().__init__()
@@ -130,8 +145,7 @@ class HGNN_HEAL(nn.Module):
 
     def forward(self, X, H, W=None, D=None, B=None, mask=None):
 
-        assert not torch.isnan(H).any()
-        assert not torch.isinf(H).any()
+        _assert_finite("HGNN_HEAL.H", H)
 
         bs, _num_v, _num_e = H.size()
         if mask is None:
@@ -146,42 +160,34 @@ class HGNN_HEAL(nn.Module):
                 D = torch.einsum('bii->bi', D)
             else:
                 D = torch.einsum('bij,bj->bi', H, W)
-        # print(D.shape, mask.shape)
-        # assert not (D<0).any()
-        # assert not torch.isnan(D).any()
-        # assert (D>=0).all()
+        D = D.clamp(min=EPS)
         D_invsqrt = torch.ones_like(D) / (torch.sqrt(D) + EPS)
         D_invsqrt = D_invsqrt * mask.squeeze(-1)
         D_invsqrt[D_invsqrt == float("inf")] = 0
 
-        assert not torch.isnan(D_invsqrt).any()
-        assert not torch.isinf(D_invsqrt).any()
+        _assert_finite("HGNN_HEAL.D_invsqrt", D_invsqrt)
 
         if B is None:
             B = torch.einsum('bij->bj', H)  # b*k
+        B = B.clamp(min=EPS)
         B_inv = torch.ones_like(B) / (B + EPS)
         B_inv[B_inv == float("inf")] = 0
 
-        assert not torch.isnan(B_inv).any()
-        assert not torch.isinf(B_inv).any()
+        _assert_finite("HGNN_HEAL.B_inv", B_inv)
 
         WB = W * B_inv
         H = torch.einsum('bi,bij->bij', D_invsqrt, H)
 
-        assert not torch.isnan(H).any()
-        assert not torch.isinf(H).any()
-        assert not torch.isnan(X).any()
-        assert not torch.isinf(X).any()
+        _assert_finite("HGNN_HEAL.H_scaled", H)
+        _assert_finite("HGNN_HEAL.X", X)
 
         HX = H.transpose(-2,-1).matmul(X)
 
-        assert not torch.isnan(HX).any()
-        assert not torch.isinf(HX).any()
+        _assert_finite("HGNN_HEAL.HX", HX)
 
         R = self.theta(HX.transpose(-2,-1))
 
-        assert not torch.isnan(R).any()
-        assert not torch.isinf(R).any()
+        _assert_finite("HGNN_HEAL.R", R)
 
         R = self.act(R.transpose(-2,-1))
         R = R + HX

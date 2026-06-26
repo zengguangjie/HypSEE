@@ -25,10 +25,9 @@
   "aug_ratio1": 0.2,
   "aug2": "random2",
   "aug_ratio2": 0.2,
-  "mode":"HOP",
+  "mode":"RW",
   "H1_update": "epoch",
   "hypergraph_length_list": [
-        1,
-        2,3,4
+        4,6
     ]
 }

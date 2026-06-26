@@ -59,7 +59,8 @@ parser.add_argument('--EPS', type=float, default=1e-15)
 parser.add_argument('--decay_rate', type=float, default=0.5)
 parser.add_argument('--H1_update', type=str, default='epoch', choices=['epoch', 'run', 'exp'])
 parser.add_argument('--use_config_file', type=int, default=1)
-parser.add_argument('--hgsl_arch', type=str, default='GCN')
+parser.add_argument('--gnn_arch', type=str, default='GCN',
+                    choices=['GIN', 'GCN', 'GraphConv', 'SAGEConv', 'GATConv', 'GATv2Conv', 'SGConv', 'ARMAConv'])
 # parser.add_argument('--model', type=str, default='HypSEE')
 args = parser.parse_args()
 
@@ -93,10 +94,7 @@ f.close()
 #     print("using default configs")
 configs = DotDict(configs_dict)
 
-configs['data_root'] = './data/'
-configs["data_root"] = os.path.join(configs["data_root"], configs["data_name"])
-
-assert configs.data_root == configs['data_root']
+configs.data_root = os.path.normpath(configs.data_root)
 print(configs.data_root)
 
 # print(configs)

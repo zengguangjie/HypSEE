@@ -3,7 +3,7 @@
   "data_root": "data/",
   "epochs": 300,
   "batch_size": 80,
-  "lr": 0.01,
+  "lr": 0.001,
   "weight_decay": 0.0005,
   "dim_embedding": 32,
   "dim_embedding_gnn": 32,

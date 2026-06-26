@@ -1,23 +1,88 @@
 
-
 import torch
 import argparse
-from datasets.tu_dataset import get_dataset, get_dataset_dense
+import traceback
+from typing import Any, cast
+from datasets.tu_dataset import get_dataset, subset_dataset, shuffle_dataset, TUDatasetExt, augment_batch
 import random
 import os
 import numpy as np
-from torch_geometric.loader import DataLoader, DenseDataLoader
+from torch_geometric.loader import DataLoader
 from datasets.loaders import IterLoader
 from models.model import HypSEE
-from datasets.data_utils import hypergraph_construction, hypergraph_construction_batch
 from datasets.data_utils import load_hypergraphs, hypergraph_to_dense_batch
 import torch.nn.functional as F
 from copy import deepcopy
-from datasets.data_utils import k_fold
 
 class Exp:
     def __init__(self, configs):
         self.configs = configs
+        self._debug_ctx: dict[str, Any] = {}
+        self.wandb = None
+        if configs.get("use_wandb"):
+            import wandb
+            if wandb.run is not None:
+                self.wandb = wandb
+                self.setup_wandb_metrics()
+
+    @staticmethod
+    def setup_wandb_metrics():
+        import wandb
+        if wandb.run is None:
+            return
+        wandb.define_metric("epoch", summary="none")
+        wandb.define_metric("train/*", step_metric="epoch")
+        wandb.define_metric("eval/*", step_metric="epoch")
+        wandb.define_metric("test/*", step_metric="epoch")
+        wandb.define_metric("exp_iter", summary="max")
+        wandb.define_metric("iter/*", step_metric="exp_iter")
+        wandb.define_metric("final/*", step_metric="exp_iter")
+
+    def _set_debug_ctx(self, **kwargs):
+        self._debug_ctx.update(kwargs)
+
+    def _diagnose_assertion(self):
+        ctx = self._debug_ctx
+        print("[debug] failure context:", {k: v for k, v in ctx.items() if k != "model"})
+        model = ctx.get("model")
+        if model is None:
+            return
+        bad_params = []
+        for name, param in model.named_parameters():
+            if not torch.isfinite(param).all():
+                bad_params.append(
+                    f"{name}(nan={int(torch.isnan(param).sum())}, inf={int(torch.isinf(param).sum())})"
+                )
+        if bad_params:
+            print("[debug] non-finite parameters:")
+            for line in bad_params:
+                print(" ", line)
+        else:
+            print("[debug] all parameters are finite (failure likely in activations)")
+
+    def _handle_assertion_error(self, err: AssertionError, seed: int):
+        print(f"seed {seed} failed with assertion error: {err}")
+        print(traceback.format_exc())
+        self._diagnose_assertion()
+        if self.configs.get("debug"):
+            raise
+
+    @staticmethod
+    def _is_finite(*tensors: torch.Tensor) -> bool:
+        return all(torch.isfinite(t).all() for t in tensors)
+
+    def _optimizer_step(self, model, optimizer, loss):
+        if not self._is_finite(loss):
+            print(f"[warn] skip step: non-finite loss ({loss.item()})")
+            optimizer.zero_grad(set_to_none=True)
+            return False
+
+        loss.backward()
+        grad_clip = self.configs.get("grad_clip", 5.0)
+        if grad_clip and grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
+        return True
 
     def fix_seed(self, seed=0):
         random.seed(seed)
@@ -29,265 +94,423 @@ class Exp:
         torch.cuda.manual_seed_all(seed)
         os.environ['PYTHONHASHSEED'] = str(seed)
 
+    def _log_wandb_train(self, epoch, exp_iter, train_loss, train_loss_sup, train_loss_con, train_loss_hse):
+        if self.wandb is None:
+            return
+        self.wandb.log({
+            'epoch': epoch,
+            f'train/loss_iter{exp_iter}': train_loss,
+            f'train/loss_sup_iter{exp_iter}': train_loss_sup,
+            f'train/loss_con_iter{exp_iter}': train_loss_con,
+            f'train/loss_hse_iter{exp_iter}': train_loss_hse,
+        })
+
+    def _log_wandb_eval(self, epoch, exp_iter, val_acc, val_loss_sup, val_loss_hse, val_loss_con):
+        if self.wandb is None:
+            return
+        self.wandb.log({
+            'epoch': epoch,
+            f'eval/acc_iter{exp_iter}': val_acc,
+            f'eval/loss_sup_iter{exp_iter}': val_loss_sup,
+            f'eval/loss_con_iter{exp_iter}': val_loss_con,
+            f'eval/loss_hse_iter{exp_iter}': val_loss_hse,
+            f'eval/loss_iter{exp_iter}': val_loss_sup + val_loss_hse + val_loss_con,
+        })
+
+    def _log_wandb_test_epoch(self, epoch, exp_iter, test_acc, test_loss_sup, test_loss_hse, test_loss_con):
+        if self.wandb is None:
+            return
+        self.wandb.log({
+            'epoch': epoch,
+            f'test/acc_iter{exp_iter}': test_acc,
+            f'test/loss_sup_iter{exp_iter}': test_loss_sup,
+            f'test/loss_con_iter{exp_iter}': test_loss_con,
+            f'test/loss_hse_iter{exp_iter}': test_loss_hse,
+            f'test/loss_iter{exp_iter}': test_loss_sup + test_loss_hse + test_loss_con,
+        })
+
+    def _log_iter_metrics(self, exp_iter, test_acc, test_loss_sup, test_loss_hse, test_loss_con,
+                          best_epoch, seed, test_acc_list):
+        if self.wandb is None:
+            return
+        log_dict = {
+            'exp_iter': exp_iter + 1,
+            'iter/exp_iter': exp_iter + 1,
+            'iter/test_acc': test_acc,
+            'iter/test_loss_sup': test_loss_sup,
+            'iter/test_loss_con': test_loss_con,
+            'iter/test_loss_hse': test_loss_hse,
+            'iter/test_loss': test_loss_sup + test_loss_hse + test_loss_con,
+            'iter/best_epoch': best_epoch,
+            'iter/seed': seed,
+            'iter/avg_test_acc': float(np.mean(test_acc_list)),
+            'final/avg_test_acc': float(np.mean(test_acc_list)),
+        }
+        if len(test_acc_list) > 1:
+            log_dict['final/std_test_acc'] = float(np.std(test_acc_list))
+        self.wandb.log(log_dict)
+
     def train(self, model, labeled_loader, unlabeled_loader, hypergraph_hie_aware_dict, optimizer, anchor_queue, epoch, device):
         model.train()
 
         labeled_loader.new_epoch()
         unlabeled_loader.new_epoch()
 
-        total_loss = 0
-        total_loss_sup = 0
-        total_loss_con = 0
-        total_loss_se = 0
-        for batch_index in range(len(unlabeled_loader)):
+        assert len(anchor_queue) == self.configs["num_anchors"]
+
+        warm = epoch <= self.configs["warm_epochs"]
+        beta = self.configs["beta"]
+        weight_hse = self.configs["weight_hse"]
+        num_steps = len(unlabeled_loader)
+
+        total_loss = 0.0
+        total_loss_sup = 0.0
+        total_loss_con = 0.0
+        total_loss_hse = 0.0
+        total_labeled_graphs = 0
+
+        for _ in range(num_steps):
             labeled_batch = labeled_loader.next().to(device)
             unlabeled_batch = unlabeled_loader.next().to(device)
-            # labeled_H_S = hypergraph_construction_batch(labeled_batch, self.configs['num_edges1'])
-            # unlabeled_H_S = hypergraph_construction_batch(unlabeled_batch, self.configs['num_edges2'])
-            unlabeled_graph_id_list = unlabeled_batch.graph_id.tolist()
-            labeled_graph_id_list = labeled_batch.graph_id.tolist()
-            unlabeled_H_S = hypergraph_to_dense_batch(hypergraph_dict=hypergraph_hie_aware_dict, graph_id_list=unlabeled_graph_id_list,
-                                                      num_edges=self.configs['num_edges1']).to(labeled_batch.x.dtype).to(device)
-            labeled_H_S = hypergraph_to_dense_batch(hypergraph_dict=hypergraph_hie_aware_dict, graph_id_list=labeled_graph_id_list,
-                                                    num_edges=self.configs['num_edges1']).to(labeled_batch.x.dtype).to(device)
+            num_labeled_graphs = labeled_batch.num_graphs
+            num_unlabeled_graphs = unlabeled_batch.num_graphs
 
+            labeled_H_S = self._batch_hypergraph(labeled_batch, hypergraph_hie_aware_dict, device)
+            labeled_data_S, labeled_data_T = self._augment_views(labeled_batch, device)
             optimizer.zero_grad()
 
-            S_unlabeled, T_unlabeled, out_unlabeled, S_loss_se_unlabeled, T_loss_hse_unlabeled = model(
-                unlabeled_batch, unlabeled_batch, unlabeled_H_S)
-            assert len(anchor_queue) == self.configs["num_anchors"]
-            S_anchors = torch.stack([x[0] for x in anchor_queue])
-            T_anchors = torch.stack([x[1] for x in anchor_queue])
-            loss_con = model.loss_con(S_unlabeled, S_anchors, T_unlabeled, T_anchors)
-
-            S_labeled, T_labeled, out_labeled, S_loss_se_labeled, T_loss_hse_labeled = model(
-                labeled_batch, labeled_batch, labeled_H_S)
+            S_labeled, T_labeled, out_labeled, loss_hse_S_labeled, loss_hse_T_labeled = model(
+                labeled_data_S, labeled_data_T, labeled_H_S)
             loss_sup = F.cross_entropy(out_labeled, labeled_batch.y)
 
-            if epoch > self.configs["warm_epochs"]:
-                loss = loss_sup \
-                       + self.configs["beta"] * loss_con \
-                       + self.configs["weight_hse"] * (S_loss_se_unlabeled + T_loss_hse_unlabeled) \
-                       + self.configs["weight_hse"] * (S_loss_se_labeled + T_loss_hse_labeled) / 5 \
+            unlabeled_H_S = self._batch_hypergraph(unlabeled_batch, hypergraph_hie_aware_dict, device)
+            unlabeled_data_S, unlabeled_data_T = self._augment_views(unlabeled_batch, device)
 
-            else:
+            def _compute_aux_losses():
+                S_unlabeled, T_unlabeled, _, loss_hse_S_unlabeled, loss_hse_T_unlabeled = model(
+                    unlabeled_data_S, unlabeled_data_T, unlabeled_H_S)
+                S_anchors = torch.stack([x[0] for x in anchor_queue])
+                T_anchors = torch.stack([x[1] for x in anchor_queue])
+                loss_con = model.loss_con(S_unlabeled, S_anchors, T_unlabeled, T_anchors)
+                hse_labeled_scale = num_labeled_graphs / max(num_unlabeled_graphs, 1)
+                loss_hse = (loss_hse_S_unlabeled + loss_hse_T_unlabeled
+                            + hse_labeled_scale * (loss_hse_S_labeled + loss_hse_T_labeled))
+                return loss_con, loss_hse
+
+            if warm:
+                with torch.no_grad():
+                    loss_con, loss_hse = _compute_aux_losses()
                 loss = loss_sup
+            else:
+                loss_con, loss_hse = _compute_aux_losses()
+                loss = loss_sup + beta * loss_con + weight_hse * loss_hse
 
-            loss.backward()
-            optimizer.step()
+            total_loss_con += float(beta * loss_con)
+            total_loss_hse += float(weight_hse * loss_hse)
 
-            total_loss += float(loss) * unlabeled_batch.num_graphs
-            total_loss_sup += float(loss_sup) * unlabeled_batch.num_graphs
-            total_loss_con += float(
-                self.configs["beta"] * loss_con) * unlabeled_batch.num_graphs  # unlabeled_batch.num_graphs or labeled????
-            total_loss_se += float(
-                self.configs["weight_hse"] * (S_loss_se_labeled + T_loss_hse_labeled)) * unlabeled_batch.num_graphs \
-                             + float(
-                self.configs["weight_hse"] * (S_loss_se_unlabeled + T_loss_hse_unlabeled)) * unlabeled_batch.num_graphs
+            if not self._optimizer_step(model, optimizer, loss):
+                continue
 
-            for index in range(len(labeled_batch)):
-                anchor_queue.append((S_labeled[index, :].detach(), T_labeled[index, :].detach()))
+            total_loss += float(loss)
+            total_loss_sup += float(loss_sup) * num_labeled_graphs
+            total_labeled_graphs += num_labeled_graphs
+
+            for i in range(num_labeled_graphs):
+                anchor_queue.append((S_labeled[i].detach(), T_labeled[i].detach()))
                 if len(anchor_queue) > self.configs["num_anchors"]:
                     anchor_queue.pop(0)
 
-        return total_loss / len(unlabeled_loader.loader.dataset), total_loss_sup / len(
-            unlabeled_loader.loader.dataset), \
-               total_loss_con / len(unlabeled_loader.loader.dataset), total_loss_se / (
-                   len(unlabeled_loader.loader.dataset))
+        return (
+            total_loss / num_steps,
+            total_loss_sup / total_labeled_graphs,
+            total_loss_con / num_steps,
+            total_loss_hse / num_steps,
+        )
+
+    def _batch_hypergraph(self, batch, hypergraph_hie_aware_dict, device):
+        return hypergraph_to_dense_batch(
+            hypergraph_dict=hypergraph_hie_aware_dict,
+            graph_id_list=[int(gid) for gid in batch.graph_id.view(-1).tolist()],
+            num_edges=self.configs['num_edges1'],
+        ).to(batch.x.dtype).to(device)
+
+    def _augment_views(self, batch, device, augment=True):
+        if not augment:
+            batch = batch.to(device)
+            return batch, batch
+
+        cfg = self.configs
+        aug1 = cfg.get("aug1", "none")
+        aug_ratio1 = cfg.get("aug_ratio1", 0.2)
+        aug2 = cfg.get("aug2", "none")
+        aug_ratio2 = cfg.get("aug_ratio2", 0.2)
+        npower = cfg.get("npower", 1.0)
+
+        data_S = cast(Any, augment_batch(batch, aug1, aug_ratio1, npower=npower)).to(device)
+        data_T = cast(Any, augment_batch(batch, aug2, aug_ratio2, npower=npower)).to(device)
+        return data_S, data_T
 
     @torch.no_grad()
-    def test(self, model, test_loader, hypergraph_hie_aware_dict, device):
-        # print(type(hypergraph_hie_aware_dict))
-        # exit(0)
+    def evaluate(self, model, loader, hypergraph_hie_aware_dict, device, anchor_queue=None, epoch=None):
         model.eval()
 
         total_correct = 0
         total_loss_sup = 0
         total_loss_hse = 0
-        test_loader.new_epoch()
-        for _ in range(len(test_loader)):
-            # for data_S, data_T in zip(test_loader_S, test_loader_T):
-            test_batch = test_loader.next().to(device)
-            # H_S = hypergraph_construction_batch(test_batch, self.configs['num_edges1'])
-            test_graph_id_list = test_batch.graph_id.tolist()
-            # print(test_graph_id_list)
-            test_H_S = hypergraph_to_dense_batch(hypergraph_dict=hypergraph_hie_aware_dict, graph_id_list=test_graph_id_list,
-                                                 num_edges=self.configs['num_edges1']).to(test_batch.x.dtype).to(device)
-            S_test, T_test, out, S_loss_se_test, T_loss_hse_test = model(test_batch, test_batch, test_H_S)
-            loss_sup = F.cross_entropy(out, test_batch.y)
-            total_loss_sup += float(loss_sup) * test_batch.num_graphs
-            total_loss_hse += float(self.configs["weight_hse"] * (S_loss_se_test + T_loss_hse_test)) * test_batch.num_graphs
-            out = torch.softmax(out, dim=-1)
-            pred = out.argmax(dim=-1)
-            total_correct += int((pred == test_batch.y).sum())
-        test_acc = total_correct / len(test_loader.loader.dataset)
-        loss_sup = total_loss_sup / len(test_loader.loader.dataset)
-        loss_se = total_loss_hse / len(test_loader.loader.dataset)
-        return test_acc, loss_sup, loss_se
+        total_loss_con = 0.0
+        num_samples = len(loader.loader.dataset)
+        num_batches = len(loader)
 
-    def run(self, seed, device):
-        self.fix_seed(seed)
+        compute_loss_con = (
+            anchor_queue is not None
+            and len(anchor_queue) == self.configs["num_anchors"]
+        )
+        if compute_loss_con:
+            S_anchors = torch.stack([x[0] for x in anchor_queue])
+            T_anchors = torch.stack([x[1] for x in anchor_queue])
 
-        dataset = get_dataset(name=self.configs["data_name"], root=self.configs["data_root"], feat_str=self.configs["feat_str"])
-        dataset.aug = 'none'
-        dataset = dataset.shuffle()
+        loader.new_epoch()
+        for _ in range(num_batches):
+            batch = loader.next().to(device)
+            H_S = self._batch_hypergraph(batch, hypergraph_hie_aware_dict, device)
+            data_S, data_T = self._augment_views(batch, device, augment=False)
+            S, T, out, loss_hse_S, loss_hse_T = model(data_S, data_T, H_S)
 
-        avg_num_nodes = int(dataset._data.x.size(0) / len(dataset))
+            total_loss_sup += float(F.cross_entropy(out, batch.y)) * batch.num_graphs
+            total_loss_hse += float(
+                self.configs["weight_hse"] * (loss_hse_S + loss_hse_T)) * batch.num_graphs
+            if compute_loss_con:
+                loss_con = model.loss_con(S, S_anchors, T, T_anchors)
+                total_loss_con += float(self.configs["beta"] * loss_con)
+            pred = out.softmax(dim=-1).argmax(dim=-1)
+            total_correct += int((pred == batch.y).sum())
 
-        labeled_loader = IterLoader(DataLoader(dataset[:0.1], batch_size=int(np.ceil(self.configs["batch_size"] / 5)), shuffle=False))
-        unlabeled_loader = IterLoader(DataLoader(dataset[0.2:0.7], batch_size=self.configs["batch_size"], shuffle=False))
-        val_loader = IterLoader(DataLoader(dataset[0.7:0.8], batch_size=self.configs["batch_size"], shuffle=False))
-        test_loader = IterLoader(DataLoader(dataset[0.8:1.0], batch_size=self.configs["batch_size"], shuffle=False))
+        return (
+            total_correct / num_samples,
+            total_loss_sup / num_samples,
+            total_loss_hse / num_samples,
+            total_loss_con / num_batches if compute_loss_con else 0.0,
+        )
 
-        model = HypSEE(in_channels=dataset.num_features,
-                        hidden_channels_gnn=self.configs["dim_embedding_gnn"],
-                        hidden_channels=self.configs["dim_embedding"],
-                        out_channels=dataset.num_classes,
-                        num_layers_gnn=self.configs["num_layers_gnn"],
-                        num_edges2=self.configs["num_edges2"],
-                        avg_num_nodes=avg_num_nodes,
-                        height=self.configs["height"],
-                        EPS=self.configs["EPS"],
-                        decay_rate=self.configs['decay_rate']).to(device)
-        for key in model.hyper_hierarchical_GRL.hyperconv_dict.keys():
-            model.hyper_hierarchical_GRL.hyperconv_dict[key].to(device)
-        for key in model.hyper_hierarchical_GRL.pool_dict.keys():
-            model.hyper_hierarchical_GRL.pool_dict[key].to(device)
-
-        optimizer = torch.optim.Adam(model.parameters(), lr=self.configs["lr"], weight_decay=self.configs["weight_decay"])
+    def _create_model(self, dataset: TUDatasetExt, avg_num_nodes: int, device: torch.device) -> HypSEE:
+        cfg = self.configs
+        model = HypSEE(
+            in_channels=dataset.num_features,
+            hidden_channels_gnn=cfg["dim_embedding_gnn"],
+            hidden_channels=cfg["dim_embedding"],
+            out_channels=dataset.num_classes,
+            num_layers_gnn=cfg["num_layers_gnn"],
+            num_edges2=cfg["num_edges2"],
+            avg_num_nodes=avg_num_nodes,
+            height=cfg["height"],
+            EPS=cfg["EPS"],
+            decay_rate=cfg["decay_rate"],
+            gnn_arch=cfg.get("gnn_arch", cfg.get("hgsl_arch", "GCN")),
+            hgsl_constraint=cfg.get("hgsl_constraint", "sigmoid"),
+            hgsl_topk=cfg.get("hgsl_topk") or None,
+            use_gnn_encoder_S=cfg.get("use_gnn_encoder_S", False),
+        )
         model.reset_parameters()
+        return model.to(device)
 
-        best_epoch = 0
+    def _load_hypergraphs(self, dataset, seed=0):
+        return load_hypergraphs(
+            data_name=self.configs['data_name'],
+            data_root=self.configs['data_root'],
+            mode=self.configs['mode'],
+            hyperedge_length_list=self.configs['hypergraph_length_list'],
+            num_edges=self.configs['num_edges1'],
+            num_graphs=len(dataset),
+            seed=seed,
+        )
+
+    def _init_anchor_queue(self, model, labeled_loader, hypergraph_hie_aware_dict, device):
+        num_anchors = self.configs["num_anchors"]
+        with torch.no_grad():
+            model.eval()
+            labeled_loader.new_epoch()
+            anchor_queue = []
+            while len(anchor_queue) < num_anchors:
+                labeled_batch = labeled_loader.next().to(device)
+                labeled_H_S = self._batch_hypergraph(labeled_batch, hypergraph_hie_aware_dict, device)
+                labeled_data_S, labeled_data_T = self._augment_views(labeled_batch, device)
+                S_labeled, T_labeled, _, _, _ = model(labeled_data_S, labeled_data_T, labeled_H_S)
+                need = num_anchors - len(anchor_queue)
+                for i in range(min(S_labeled.shape[0], need)):
+                    anchor_queue.append((S_labeled[i], T_labeled[i]))
+            labeled_loader.new_epoch()
+        assert len(anchor_queue) == num_anchors
+        model.train()
+        return anchor_queue
+
+    def run(self, seed, device, exp_iter=0):
+        self.fix_seed(seed)
+        self._set_debug_ctx(seed=seed, epoch=None, phase="setup", model=None)
+
+        dataset: TUDatasetExt = get_dataset(
+            name=self.configs["data_name"],
+            root=self.configs["data_root"],
+            feat_str=self.configs["feat_str"],
+        )
+        dataset = shuffle_dataset(dataset)
+
+        data = dataset._data
+        if data is None or data.x is None:
+            raise RuntimeError("dataset node features are not initialized")
+        avg_num_nodes = int(data.x.size(0) / len(dataset))
+
+        labeled_loader = IterLoader(DataLoader(
+            subset_dataset(dataset, slice(None, 0.1)),
+            batch_size=int(np.ceil(self.configs["batch_size"] / 5)),
+            shuffle=False,
+        ))
+        unlabeled_loader = IterLoader(DataLoader(
+            subset_dataset(dataset, slice(0.2, 0.7)),
+            batch_size=self.configs["batch_size"],
+            shuffle=False,
+        ))
+        val_loader = IterLoader(DataLoader(
+            subset_dataset(dataset, slice(0.7, 0.8)),
+            batch_size=self.configs["batch_size"],
+            shuffle=False,
+        ))
+        test_loader = IterLoader(DataLoader(
+            subset_dataset(dataset, slice(0.8, 1.0)),
+            batch_size=self.configs["batch_size"],
+            shuffle=False,
+        ))
+
+        model = self._create_model(dataset, avg_num_nodes, device)
+        self._set_debug_ctx(model=model)
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=self.configs["lr"],
+            weight_decay=self.configs["weight_decay"],
+        )
+
+        best_epoch = None
+        best_state = None
         best_val_loss_sup = 1e10
         best_val_loss_sup_se = 1e10
         best_val_acc = 0.0
-        best_test_acc = 0.0
 
-        hypergraph_hie_aware_dict = load_hypergraphs(data_name=self.configs['data_name'],
-                                                     data_root=self.configs['data_root'], mode=self.configs['mode'],
-                                                     hyperedge_length_list=self.configs['hypergraph_length_list'],
-                                                     num_edges=self.configs['num_edges1'], num_graphs=len(dataset))
-        with torch.no_grad():
-            labeled_loader.new_epoch()
-            anchor_queue = []
-
-            while len(anchor_queue) < self.configs["num_anchors"]:
-                labeled_batch = labeled_loader.next().to(device)
-                # labeled_H_S = hypergraph_construction_batch(labeled_batch_S, self.configs['num_edges1'])
-                graph_id_list = labeled_batch.graph_id.tolist()
-                labeled_H_S = hypergraph_to_dense_batch(hypergraph_dict=hypergraph_hie_aware_dict, graph_id_list=graph_id_list,
-                                                        num_edges=self.configs['num_edges1']).to(labeled_batch.x.dtype).to(device)
-                S_labeled, T_labeled, out_labeled, S_loss_se_labeled, T_loss_hse_labeled = model(labeled_batch, labeled_batch, labeled_H_S)
-                S_labeled, T_labeled = S_labeled.detach(), T_labeled.detach()
-                for i in range(S_labeled.shape[0]):
-                    anchor_queue.append((S_labeled[i], T_labeled[i]))
-                    if len(anchor_queue) >= self.configs["num_anchors"]:
-                        break
-            labeled_loader.new_epoch()
-
-        print("------------------anchors ends-----------------")
+        hypergraph_hie_aware_dict = None
+        anchor_queue = []
 
         for epoch in range(1, self.configs["epochs"] + 1):
-            if self.configs['H1_update'] == 'epoch':
-                hypergraph_hie_aware_dict = load_hypergraphs(data_name=self.configs['data_name'],
-                                                             data_root=self.configs['data_root'], mode=self.configs['mode'],
-                                                             hyperedge_length_list=self.configs['hypergraph_length_list'],
-                                                             num_edges=self.configs['num_edges1'], num_graphs=len(dataset))
+            self._set_debug_ctx(epoch=epoch)
+            if self.configs['H1_update'] == 'epoch' or epoch == 1:
+                self._set_debug_ctx(phase="load_hypergraphs")
+                hypergraph_hie_aware_dict = self._load_hypergraphs(dataset, seed=seed + epoch)
 
-            # print(hypergraph_hie_aware_dict)
+            if epoch == 1 or self.configs['H1_update'] == 'epoch':
+                assert hypergraph_hie_aware_dict is not None
+                self._set_debug_ctx(phase="init_anchor_queue")
+                anchor_queue = self._init_anchor_queue(
+                    model, labeled_loader, hypergraph_hie_aware_dict, device)
 
+            assert hypergraph_hie_aware_dict is not None
+            self._set_debug_ctx(phase="train")
             train_loss, train_loss_sup, train_loss_con, train_loss_se = self.train(model, labeled_loader,
                                                                               unlabeled_loader, hypergraph_hie_aware_dict,
                                                                               optimizer, anchor_queue, epoch, device)
-            val_acc, val_loss_sup, val_loss_se = self.test(model, val_loader, hypergraph_hie_aware_dict, device)
-            test_acc, _, _ = self.test(model, test_loader, hypergraph_hie_aware_dict, device)
+            self._set_debug_ctx(phase="evaluate")
+            val_acc, val_loss_sup, val_loss_se, val_loss_con = self.evaluate(
+                model, val_loader, hypergraph_hie_aware_dict, device,
+                anchor_queue=anchor_queue, epoch=epoch)
+            test_acc, test_loss_sup, test_loss_hse, test_loss_con = self.evaluate(
+                model, test_loader, hypergraph_hie_aware_dict, device,
+                anchor_queue=anchor_queue, epoch=epoch)
             print(
-                "epoch{}:\ttrain loss: {}\ttrain_sup loss: {}\ttrain_con loss: {}\ttrain_hse loss: {}\tval_acc: {}\ttest_acc:{}"
+                "epoch{}:\ttrain loss: {}\ttrain_sup loss: {}\ttrain_con loss: {}\ttrain_hse loss: {}\t"
+                "val_acc: {}\ttest_acc: {}"
                 .format(epoch, train_loss, train_loss_sup, train_loss_con, train_loss_se, val_acc, test_acc))
+            self._log_wandb_train(
+                epoch, exp_iter, train_loss, train_loss_sup, train_loss_con, train_loss_se)
+            self._log_wandb_eval(
+                epoch, exp_iter, val_acc, val_loss_sup, val_loss_se, val_loss_con)
+            self._log_wandb_test_epoch(
+                epoch, exp_iter, test_acc, test_loss_sup, test_loss_hse, test_loss_con)
             if epoch > self.configs["warm_epochs"]:
-                if self.configs["epoch_select"] == 'val_loss_sup':
-                    if val_loss_sup < best_val_loss_sup:
+                epoch_select = self.configs["epoch_select"]
+                improved = False
+                score = 0.0
+                if epoch_select == 'val_loss_sup':
+                    if best_state is None or val_loss_sup < best_val_loss_sup:
                         best_val_loss_sup = val_loss_sup
-                        best_epoch = epoch
-                        best_test_acc = test_acc
-                        print("epoch{}:\ttest_acc:{}\tval_loss_sup\t{}".format(best_epoch, test_acc, val_loss_sup))
-                elif self.configs["epoch_select"] == 'val_acc':
-                    if val_acc > best_val_acc:
+                        improved = True
+                        score = val_loss_sup
+                elif epoch_select == 'val_acc':
+                    if best_state is None or val_acc > best_val_acc:
                         best_val_acc = val_acc
-                        best_epoch = epoch
-                        best_test_acc = test_acc
-                        print("epoch{}:\ttest_acc:{}".format(best_epoch, test_acc))
-                elif self.configs["epoch_select"] == 'val_acc_eq':
-                    if val_acc >= best_val_acc:
+                        improved = True
+                        score = val_acc
+                elif epoch_select == 'val_acc_eq':
+                    if best_state is None or val_acc >= best_val_acc:
                         best_val_acc = val_acc
-                        best_epoch = epoch
-                        best_test_acc = test_acc
-                        print("epoch{}:\ttest_acc:{}".format(best_epoch, test_acc))
-                elif self.configs["epoch_select"] == 'val_loss_sup_hse':
-                    if val_loss_sup + val_loss_se < best_val_loss_sup_se:
-                        best_val_loss_sup_se = val_loss_sup + val_loss_se
-                        best_epoch = epoch
-                        best_test_acc = test_acc
-                        print("epoch{}:\ttest_acc:{}".format(best_epoch, test_acc))
+                        improved = True
+                        score = val_acc
+                elif epoch_select == 'val_loss_sup_hse':
+                    val_loss_sup_hse = val_loss_sup + val_loss_se
+                    if best_state is None or val_loss_sup_hse < best_val_loss_sup_se:
+                        best_val_loss_sup_se = val_loss_sup_hse
+                        improved = True
+                        score = val_loss_sup_hse
                 else:
-                    raise NotImplementedError
-        return best_test_acc
+                    raise NotImplementedError(epoch_select)
 
+                if improved:
+                    best_epoch = epoch
+                    best_state = deepcopy(model.state_dict())
+                    print("epoch{}:\t{}={}".format(best_epoch, epoch_select, score))
 
-
+        if best_state is not None:
+            model.load_state_dict(best_state)
+        test_acc, test_loss_sup, test_loss_hse, test_loss_con = self.evaluate(
+            model, test_loader, hypergraph_hie_aware_dict, device,
+            anchor_queue=anchor_queue, epoch=self.configs["epochs"])
+        print(
+            "best_epoch:{}\ttest_acc:{}\ttest_loss_sup:{}\ttest_loss_con:{}\ttest_loss_hse:{}"
+            .format(best_epoch, test_acc, test_loss_sup, test_loss_con, test_loss_hse))
+        return test_acc, best_epoch, test_loss_sup, test_loss_hse, test_loss_con
 
 
 
     def exp(self):
-        # print("running")
         print(self.configs)
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
-        else:
-            device = torch.device("cpu")
-        # self.configs["device"] = device
-
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(self.configs["data_name"], self.configs["data_root"])
 
-        if 'hypergraph_length_list' not in self.configs.keys():
-            self.configs['hypergraph_length_list'] = [4, 6]
-        # self.configs['feat_str'] = 'deg+odeg100'
-        # if self.configs['data_name'] in ['DD','REDDIT-BINARY', 'REDDIT-MULTI-5K']:
-        #     self.configs['feat_str'] = 'deg+odeg10'
-        if self.configs['data_name'] == 'COLLAB':
-            if self.configs['feat_str'] == '':
-                self.configs['feat_str'] = 'deg+odeg100'
+        if "hypergraph_length_list" not in self.configs:
+            self.configs["hypergraph_length_list"] = [4, 6]
+        if self.configs["data_name"] == "COLLAB" and self.configs["feat_str"] == "":
+            self.configs["feat_str"] = "deg+odeg100"
 
         test_acc_list = []
-        repeat = 0
         seed = 0
-        while repeat < self.configs["runs"]:
-            # print(repeat)
-            # with torch.autograd.detect_anomaly(True):
-            if seed > 10:
-                return 0.0
-            try:
-                best_acc = self.run(seed, device)
-                print("run: {}\tacc: {}\t".format(repeat, best_acc))
-                test_acc_list.append(best_acc)
-                repeat += 1
-                seed += 1
-            except AssertionError as e:
-                seed += 1
-                print(f"Caught an assertion error: {e}")
-                continue
-        print("test_acc_mean: {}\tstd{}".format(np.mean(test_acc_list), np.std(test_acc_list)))
+        exp_iter = 0
+        while len(test_acc_list) < self.configs["runs"]:
+            test_acc, best_epoch, test_loss_sup, test_loss_hse, test_loss_con = self.run(
+                seed, device, exp_iter=exp_iter)
+            print(f"run: {len(test_acc_list)}\tacc: {test_acc}")
+            test_acc_list.append(test_acc)
+            self._log_iter_metrics(
+                exp_iter, test_acc, test_loss_sup, test_loss_hse, test_loss_con,
+                best_epoch, seed, test_acc_list)
+            exp_iter += 1
+            seed += 1
 
-        import json
-        from datetime import datetime
-
-        self.configs.mean = np.mean(test_acc_list)
-        self.configs.std = np.std(test_acc_list)
-        current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-        file_name = f"./results/{self.configs.data_name}/Time_{current_time}_ACC_{self.configs.mean}.txt"
-        with open(file_name, 'w') as file:
-            json.dump(self.configs, file, indent=4)
-
-        # self.configs.test_acc_list = test_acc_list
-
-        return np.mean(test_acc_list)
+        mean_acc = float(np.mean(test_acc_list))
+        std_acc = float(np.std(test_acc_list))
+        print(f"test_acc_mean: {mean_acc}\tstd: {std_acc}")
+        if self.wandb is not None:
+            self.wandb.log({
+                'exp_iter': exp_iter,
+                'final/avg_test_acc': mean_acc,
+                'final/std_test_acc': std_acc,
+            })
+            self.wandb.summary.update({
+                'final/avg_test_acc': mean_acc,
+                'final/std_test_acc': std_acc,
+            })
+        return mean_acc

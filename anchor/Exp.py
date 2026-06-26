@@ -150,7 +150,11 @@ class Exp:
                         avg_num_nodes=avg_num_nodes,
                         height=self.configs["height"],
                         EPS=self.configs["EPS"],
-                        decay_rate=self.configs['decay_rate']).to(device)
+                        decay_rate=self.configs['decay_rate'],
+                        gnn_arch=self.configs.get('gnn_arch', self.configs.get('hgsl_arch', 'GCN')),
+                        hgsl_constraint=self.configs.get('hgsl_constraint', 'sigmoid'),
+                        hgsl_topk=self.configs.get('hgsl_topk') or None,
+                        use_gnn_encoder_S=bool(self.configs.get('use_gnn_encoder_S', 1))).to(device)
         for key in model.hyper_hierarchical_GRL.hyperconv_dict.keys():
             model.hyper_hierarchical_GRL.hyperconv_dict[key].to(device)
         for key in model.hyper_hierarchical_GRL.pool_dict.keys():
@@ -168,7 +172,8 @@ class Exp:
         hypergraph_hie_aware_dict = load_hypergraphs(data_name=self.configs['data_name'],
                                                      data_root=self.configs['data_root'], mode=self.configs['mode'],
                                                      hyperedge_length_list=self.configs['hypergraph_length_list'],
-                                                     num_edges=self.configs['num_edges1'], num_graphs=len(dataset))
+                                                     num_edges=self.configs['num_edges1'], num_graphs=len(dataset),
+                                                     seed=seed)
         with torch.no_grad():
             labeled_loader.new_epoch()
             anchor_queue = []
@@ -194,7 +199,8 @@ class Exp:
                 hypergraph_hie_aware_dict = load_hypergraphs(data_name=self.configs['data_name'],
                                                              data_root=self.configs['data_root'], mode=self.configs['mode'],
                                                              hyperedge_length_list=self.configs['hypergraph_length_list'],
-                                                             num_edges=self.configs['num_edges1'], num_graphs=len(dataset))
+                                                             num_edges=self.configs['num_edges1'], num_graphs=len(dataset),
+                                                             seed=seed + epoch)
 
             # print(hypergraph_hie_aware_dict)
 

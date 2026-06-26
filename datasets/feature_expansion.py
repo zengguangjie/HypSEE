@@ -38,6 +38,7 @@ class FeatureExpander(MessagePassing):
         self.edge_norm_diag = 1e-8  # edge norm is used, and set A diag to it
 
         self.graph_id = 0
+        self._edge_norm = None
 
     def transform(self, data):
         if data.x is None:
@@ -93,7 +94,7 @@ class FeatureExpander(MessagePassing):
         #     data.x = x_base
         #     data.xg = torch.cat(super_nodes, 0).view((1, -1))
 
-        data.graph_id = self.graph_id
+        data.graph_id = torch.tensor([self.graph_id], dtype=torch.long)
         self.graph_id += 1
 
         return data
@@ -125,7 +126,7 @@ class FeatureExpander(MessagePassing):
         G.add_nodes_from(range(data.num_nodes))  # in case missing node ids
         closeness = nx.algorithms.closeness_centrality(G)
         betweenness = nx.algorithms.betweenness_centrality(G)
-        pagerank = nx.pagerank_numpy(G)
+        pagerank = nx.pagerank(G)
         centrality_features = torch.tensor(
             [[closeness[i], betweenness[i], pagerank[i]] for i in range(
                 data.num_nodes)])
@@ -137,15 +138,19 @@ class FeatureExpander(MessagePassing):
 
         edge_index, norm = self.norm(
             edge_index, num_nodes, edge_weight, diag_val=self.edge_norm_diag)
+        self._edge_norm = norm
 
         xs = []
         for k in range(1, self.AK + 1):
-            x = self.propagate(edge_index, x=x, norm=norm)
+            x = self.propagate(edge_index, x=x)
             xs.append(x)
+        self._edge_norm = None
         return torch.cat(xs, -1)
 
-    def message(self, x_j, norm):
-        return norm.view(-1, 1) * x_j
+    def message(self, x_j):
+        if self._edge_norm is None:
+            raise RuntimeError("edge normalization is not initialized before propagate")
+        return self._edge_norm.view(-1, 1) * x_j
 
     @staticmethod
     def norm(edge_index, num_nodes, edge_weight, diag_val=1e-8, dtype=None):
@@ -157,7 +162,7 @@ class FeatureExpander(MessagePassing):
         assert edge_weight.size(0) == edge_index.size(1)
 
         edge_index, edge_weight = remove_self_loops(edge_index, edge_weight)
-        edge_index = add_self_loops(edge_index, num_nodes=num_nodes)
+        edge_index, _ = add_self_loops(edge_index, num_nodes=num_nodes)
         # Add edge_weight for loop edges.
         loop_weight = torch.full((num_nodes, ),
                                  diag_val,

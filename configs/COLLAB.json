@@ -14,7 +14,7 @@
     "beta": 1,
     "weight_hse": 0.001,
     "warm_epochs": 2,
-    "epoch_select": "val_loss_sup",
+    "epoch_select": "val_acc",
     "runs": 5,
     "feat_str": "deg+odeg100",
     "height": 3,
