@@ -1,6 +1,6 @@
 import copy
 import re
-from typing import Optional, cast
+from typing import Optional, Union, cast
 
 import numpy as np
 import torch
@@ -11,6 +11,22 @@ from torch_geometric.data.separate import separate
 from torch_geometric.datasets import TUDataset
 
 from datasets.feature_expansion import FeatureExpander
+
+
+def _default_aug_device(device: Optional[Union[torch.device, str]] = None) -> torch.device:
+    if device is not None:
+        return torch.device(device)
+    return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+def _cpu_adj_list(edge_index: torch.Tensor, num_nodes: int) -> list[list[int]]:
+    """Build an adjacency list on CPU for subgraph sampling (NetworkX-free)."""
+    adj: list[list[int]] = [[] for _ in range(num_nodes)]
+    ei = edge_index.detach().cpu().numpy()
+    for u, v in zip(ei[0], ei[1]):
+        u_i, v_i = int(u), int(v)
+        adj[u_i].append(v_i)
+    return adj
 
 
 def _parse_feat_str(feat_str):
@@ -87,11 +103,10 @@ class AddGraphIdTransform:
 
 def node_drop(data, aug_ratio):
     node_num, _ = data.x.size()
+    device = data.x.device
     drop_num = int(node_num * aug_ratio)
 
-    idx_perm = np.random.permutation(node_num)
-    idx_nondrop = idx_perm[drop_num:].tolist()
-    idx_nondrop.sort()
+    idx_nondrop = torch.randperm(node_num, device=device)[drop_num:].sort().values
 
     edge_index, _ = tg_utils.subgraph(
         idx_nondrop, data.edge_index, relabel_nodes=True, num_nodes=node_num
@@ -104,15 +119,21 @@ def node_drop(data, aug_ratio):
 
 def weighted_drop_nodes(data, aug_ratio, npower):
     node_num, _ = data.x.size()
+    device = data.x.device
     drop_num = int(node_num * aug_ratio)
+    if drop_num <= 0:
+        return data
+    if drop_num >= node_num:
+        drop_num = node_num - 1
 
-    adj = np.zeros((node_num, node_num))
-    adj[data.edge_index[0], data.edge_index[1]] = 1
-    deg = adj.sum(axis=1)
-    deg[deg == 0] = 0.1
-    deg = deg ** npower
-    idx_drop = np.random.choice(node_num, drop_num, replace=False, p=deg / deg.sum())
-    idx_nondrop = sorted(n for n in range(node_num) if n not in idx_drop)
+    row = data.edge_index[0]
+    deg = torch.zeros(node_num, device=device, dtype=torch.float)
+    deg.scatter_add_(0, row, torch.ones(row.size(0), device=device))
+    deg = deg.clamp(min=0.1).pow(npower)
+    idx_drop = torch.multinomial(deg, drop_num, replacement=False)
+    keep_mask = torch.ones(node_num, dtype=torch.bool, device=device)
+    keep_mask[idx_drop] = False
+    idx_nondrop = keep_mask.nonzero(as_tuple=False).view(-1)
 
     edge_index, _ = tg_utils.subgraph(
         idx_nondrop, data.edge_index, relabel_nodes=True, num_nodes=node_num
@@ -127,16 +148,23 @@ def edge_pert(data, aug_ratio):
     node_num, _ = data.x.size()
     _, edge_num = data.edge_index.size()
     pert_num = int(edge_num * aug_ratio)
-    device = data.edge_index.device
+    device = data.x.device
 
-    edge_index = data.edge_index[
-        :, np.random.choice(edge_num, edge_num - pert_num, replace=False)
-    ]
-    idx_add = np.random.choice(node_num, (2, pert_num))
+    if pert_num <= 0 or edge_num <= 0:
+        return data
+
+    keep_count = max(edge_num - pert_num, 0)
+    if keep_count > 0:
+        keep_idx = torch.randperm(edge_num, device=device)[:keep_count]
+        edge_index = data.edge_index[:, keep_idx]
+    else:
+        edge_index = data.edge_index.new_empty((2, 0))
+
+    idx_add = torch.randint(0, node_num, (2, pert_num), device=device)
     adj = torch.zeros((node_num, node_num), device=device)
-    adj[edge_index[0], edge_index[1]] = 1
-    idx_add_t = torch.as_tensor(idx_add, device=device)
-    adj[idx_add_t[0], idx_add_t[1]] = 1
+    if edge_index.numel() > 0:
+        adj[edge_index[0], edge_index[1]] = 1
+    adj[idx_add[0], idx_add[1]] = 1
     adj.fill_diagonal_(0)
     data.edge_index = adj.nonzero(as_tuple=False).t()
     data.num_nodes, _ = data.x.shape
@@ -144,24 +172,23 @@ def edge_pert(data, aug_ratio):
 
 
 def subgraph(data, aug_ratio):
-    G = tg_utils.to_networkx(data)
     node_num, _ = data.x.size()
-    sub_num = int(node_num * (1 - aug_ratio))
+    device = data.x.device
+    sub_num = max(int(node_num * (1 - aug_ratio)), 1)
 
-    idx_sub = [np.random.randint(node_num, size=1)[0]]
-    idx_neigh = set(G.neighbors(idx_sub[-1]))
+    adj = _cpu_adj_list(data.edge_index, node_num)
+    idx_sub = [int(torch.randint(0, node_num, (1,), device=device).item())]
+    idx_neigh = set(adj[idx_sub[-1]])
 
     while len(idx_sub) < sub_num:
         if len(idx_neigh) == 0:
             idx_unsub = list(set(range(node_num)) - set(idx_sub))
-            idx_neigh = {np.random.choice(idx_unsub)}
-        sample_node = np.random.choice(list(idx_neigh))
+            idx_neigh = {int(np.random.choice(idx_unsub))}
+        sample_node = int(np.random.choice(list(idx_neigh)))
         idx_sub.append(sample_node)
-        idx_neigh = (
-            idx_neigh.union(set(G.neighbors(idx_sub[-1]))).difference(set(idx_sub))
-        )
+        idx_neigh = idx_neigh.union(set(adj[idx_sub[-1]])).difference(set(idx_sub))
 
-    idx_nondrop = sorted(idx_sub)
+    idx_nondrop = torch.tensor(sorted(idx_sub), device=device, dtype=torch.long)
     edge_index, _ = tg_utils.subgraph(
         idx_nondrop, data.edge_index, relabel_nodes=True, num_nodes=node_num
     )
@@ -173,10 +200,14 @@ def subgraph(data, aug_ratio):
 
 def attr_mask(data, aug_ratio):
     node_num, _ = data.x.size()
+    device = data.x.device
     mask_num = int(node_num * aug_ratio)
+    if mask_num <= 0:
+        return data
+
     _x = data.x.clone()
     token = data.x.mean(dim=0)
-    idx_mask = np.random.choice(node_num, mask_num, replace=False)
+    idx_mask = torch.randperm(node_num, device=device)[:mask_num]
     _x[idx_mask] = token
     data.x = _x
     data.num_nodes, _ = data.x.shape
@@ -220,16 +251,18 @@ def apply_augmentation(data, aug, aug_ratio, npower=1.0):
     raise ValueError(f"unknown augmentation: {aug}")
 
 
-def augment_batch(batch, aug, aug_ratio, npower=1.0):
+def augment_batch(batch, aug, aug_ratio, npower=1.0, device=None):
+    dev = _default_aug_device(device)
     if aug == "none":
-        return batch
+        return batch.to(dev)
     from torch_geometric.data import Batch
 
-    # Augment on CPU: several augs build new tensors without preserving device.
-    data_list = [data.cpu() for data in batch.to_data_list()]
+    # deepcopy after .to(dev): apply_augmentation mutates in place; without a copy,
+    # aug1/aug2 views or the DataLoader batch could share corrupted storage.
+    # PyG Data.clone() only shallow-copies tensor fields; deepcopy remains safer here.
     aug_list = [
-        apply_augmentation(copy.deepcopy(data), aug, aug_ratio, npower)
-        for data in data_list
+        apply_augmentation(copy.deepcopy(data.to(dev)), aug, aug_ratio, npower)
+        for data in batch.to_data_list()
     ]
     return Batch.from_data_list(aug_list)
 
@@ -257,7 +290,10 @@ class TUDatasetExt(TUDataset):
         self.aug_ratio = aug_ratio
         self.npower = npower
         self._base_data_list: Optional[list[Optional[BaseData]]] = None
-        super().__init__(root, name, transform, pre_transform, pre_filter, use_node_attr)
+        super().__init__(
+            root, name, transform, pre_transform, pre_filter,
+            use_node_attr=use_node_attr,
+        )
         # TUDataset.process() calls get() before pre_transform, which can cache
         # raw graphs without graph_id/x. Drop that stale cache after init.
         self._base_data_list = None

@@ -14,6 +14,7 @@ from models.model import HypSEE
 from datasets.data_utils import (
     load_hypergraphs, hypergraph_to_dense_batch, precompute_hypergraphs,
     stratified_semi_supervised_split,
+    HypergraphDenseBatchCache,
 )
 import torch.nn.functional as F
 from copy import deepcopy
@@ -238,11 +239,15 @@ class Exp:
         )
 
     def _batch_hypergraph(self, batch, hypergraph_hie_aware_dict, device):
+        cache = getattr(self, '_hg_dense_cache', None)
         return hypergraph_to_dense_batch(
             hypergraph_dict=hypergraph_hie_aware_dict,
             graph_id_list=[int(gid) for gid in batch.graph_id.view(-1).tolist()],
             num_edges=self.configs['num_edges1'],
-        ).to(batch.x.dtype).to(device)
+            device=device,
+            dtype=batch.x.dtype,
+            cache=cache,
+        )
 
     def _augment_views(self, batch, device, augment=True):
         if not augment:
@@ -256,8 +261,8 @@ class Exp:
         aug_ratio2 = cfg.get("aug_ratio2", 0.2)
         npower = cfg.get("npower", 1.0)
 
-        data_S = cast(Any, augment_batch(batch, aug1, aug_ratio1, npower=npower)).to(device)
-        data_T = cast(Any, augment_batch(batch, aug2, aug_ratio2, npower=npower)).to(device)
+        data_S = cast(Any, augment_batch(batch, aug1, aug_ratio1, npower=npower, device=device))
+        data_T = cast(Any, augment_batch(batch, aug2, aug_ratio2, npower=npower, device=device))
         return data_S, data_T
 
     @torch.no_grad()
@@ -468,6 +473,7 @@ class Exp:
 
         hypergraph_hie_aware_dict = None
         anchor_queue = []
+        self._hg_dense_cache = HypergraphDenseBatchCache()
 
         for epoch in range(1, self.configs["epochs"] + 1):
             self._set_debug_ctx(epoch=epoch)
@@ -475,6 +481,7 @@ class Exp:
                 self._set_debug_ctx(phase="load_hypergraphs")
                 current_hypergraph_seed = seed + epoch
                 hypergraph_hie_aware_dict = self._load_hypergraphs(dataset, seed=current_hypergraph_seed)
+                self._hg_dense_cache.set_version(current_hypergraph_seed)
 
             if epoch == 1 or self.configs['H1_update'] == 'epoch':
                 assert hypergraph_hie_aware_dict is not None
@@ -550,6 +557,7 @@ class Exp:
             model.load_state_dict(best_state)
             if best_hypergraph_seed is not None:
                 hypergraph_hie_aware_dict = self._load_hypergraphs(dataset, seed=best_hypergraph_seed)
+                self._hg_dense_cache.set_version(best_hypergraph_seed)
                 anchor_queue = self._init_anchor_queue(
                     model, labeled_loader, hypergraph_hie_aware_dict, device)
         test_acc, test_loss_sup, test_loss_hse, test_loss_con = self.evaluate(
@@ -566,6 +574,9 @@ class Exp:
         del model, optimizer, lr_scheduler, anchor_queue
         del best_state, hypergraph_hie_aware_dict, dataset
         del labeled_loader, unlabeled_loader, val_loader, test_loader
+        if getattr(self, '_hg_dense_cache', None) is not None:
+            self._hg_dense_cache.clear()
+        self._hg_dense_cache = None
         self._release_cuda_memory()
 
         return test_acc, best_epoch, test_loss_sup, test_loss_hse, test_loss_con

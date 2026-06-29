@@ -10,6 +10,7 @@ import os
 from torch_geometric.utils import k_hop_subgraph
 import numpy as np
 from sklearn.model_selection import StratifiedKFold
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 
 class TwoHopNeighbor(object):
@@ -162,19 +163,115 @@ def load_hypergraphs(data_name, data_root, mode, hyperedge_length_list, num_edge
     return result_hg_dict
 
 
-def hypergraph_to_dense_batch(hypergraph_dict, graph_id_list, num_edges):
+class HypergraphDenseBatchCache:
+    """Cache dense incidence matrices H for fixed (hypergraph seed, batch graph_ids).
+
+    Invalidate via :meth:`set_version` when ``load_hypergraphs`` uses a new seed
+    (``H1_update='epoch'``) or when a new training run rebuilds the data split.
+    """
+
+    def __init__(self) -> None:
+        self._version: Optional[int] = None
+        self._cache: Dict[Tuple[int, Tuple[int, ...], int], torch.Tensor] = {}
+
+    def set_version(self, version: int) -> None:
+        if self._version != version:
+            self._version = version
+            self.clear()
+
+    @property
+    def version(self) -> Optional[int]:
+        return self._version
+
+    def clear(self) -> None:
+        self._cache.clear()
+
+    def get(
+        self,
+        graph_id_list: Sequence[int],
+        num_edges: int,
+    ) -> Optional[torch.Tensor]:
+        if self._version is None:
+            return None
+        key = (self._version, tuple(int(g) for g in graph_id_list), int(num_edges))
+        return self._cache.get(key)
+
+    def put(
+        self,
+        graph_id_list: Sequence[int],
+        num_edges: int,
+        tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        if self._version is None:
+            raise RuntimeError("HypergraphDenseBatchCache version is not set")
+        key = (self._version, tuple(int(g) for g in graph_id_list), int(num_edges))
+        self._cache[key] = tensor
+        return tensor
+
+
+def _default_device() -> torch.device:
+    return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+def _hypergraph_to_dense_batch_impl(
+    hypergraph_dict,
+    graph_id_list: Sequence[int],
+    num_edges: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Build a dense batched incidence matrix on ``device``."""
+    max_num_nodes = max(
+        int(hypergraph_dict[graph_id].size()[0]) for graph_id in graph_id_list
+    )
     H_batch = []
-    max_num_nodes = 0
-    for graph_id in graph_id_list:
-        size_i = hypergraph_dict[graph_id].size()
-        max_num_nodes = max(max_num_nodes, size_i[0])
     for graph_id in graph_id_list:
         hypergraph_i = hypergraph_dict[graph_id]
-        hypergraph_i = torch.sparse_coo_tensor(indices=hypergraph_i.indices(), values=hypergraph_i.values(), size=(max_num_nodes, num_edges))
-        H_i = hypergraph_i.to_dense()
-        H_batch.append(H_i)
-    H_batch = torch.stack(H_batch, dim=0)
-    return H_batch
+        indices = hypergraph_i.indices().to(device=device, non_blocking=True)
+        values = hypergraph_i.values().to(device=device, dtype=dtype, non_blocking=True)
+        hypergraph_i = torch.sparse_coo_tensor(
+            indices,
+            values,
+            size=(max_num_nodes, num_edges),
+            device=device,
+            dtype=dtype,
+        ).coalesce()
+        H_batch.append(hypergraph_i.to_dense())
+    return torch.stack(H_batch, dim=0)
+
+
+def hypergraph_to_dense_batch(
+    hypergraph_dict,
+    graph_id_list: Sequence[int],
+    num_edges: int,
+    device: Optional[Union[torch.device, str]] = None,
+    dtype: torch.dtype = torch.float32,
+    cache: Optional[HypergraphDenseBatchCache] = None,
+) -> torch.Tensor:
+    """Convert sparse hypergraphs to a dense batch ``(B, max_nodes, num_edges)``.
+
+    ``to_dense`` runs on ``device`` (defaults to CUDA when available).
+    Optional ``cache`` stores results keyed by
+    ``(cache.version, tuple(graph_id_list), num_edges)``.
+    """
+    graph_id_list = [int(g) for g in graph_id_list]
+    dev = _default_device() if device is None else torch.device(device)
+    if cache is not None:
+        cached = cache.get(graph_id_list, num_edges)
+        if cached is not None:
+            if cached.device != dev:
+                return cached.to(device=dev, dtype=dtype, non_blocking=True)
+            if cached.dtype != dtype:
+                return cached.to(dtype=dtype)
+            return cached
+
+    out = _hypergraph_to_dense_batch_impl(
+        hypergraph_dict, graph_id_list, num_edges, dev, dtype,
+    )
+
+    if cache is not None:
+        cache.put(graph_id_list, num_edges, out)
+    return out
 
 
 def _allocate_counts(n, ratios):
