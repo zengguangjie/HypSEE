@@ -49,6 +49,7 @@ def precompute_hypergraphs(data_name, data_root, mode, hyperedge_length, num_edg
         dataset = get_dataset(name=data_name, root=data_root)
         hypergraph_dict = {}
         store_path = os.path.join(data_root, data_name, mode, "len_{}.pt".format(int(hyperedge_length)))
+        os.makedirs(os.path.dirname(store_path), exist_ok=True)
         for data in dataset:
             graph_id = data.graph_id.item()
             assert data.num_nodes is not None
@@ -75,6 +76,7 @@ def precompute_hypergraphs(data_name, data_root, mode, hyperedge_length, num_edg
         hypergraph_dict = {}
         # hyperedge_length here is the number of neighbor hops
         store_path = os.path.join(data_root, data_name, mode, "len_{}.pt".format(int(hyperedge_length)))
+        os.makedirs(os.path.dirname(store_path), exist_ok=True)
         for data in dataset:
             graph_id = data.graph_id.item()
             num_nodes = data.num_nodes
@@ -173,6 +175,60 @@ def hypergraph_to_dense_batch(hypergraph_dict, graph_id_list, num_edges):
         H_batch.append(H_i)
     H_batch = torch.stack(H_batch, dim=0)
     return H_batch
+
+
+def _allocate_counts(n, ratios):
+    """Largest-remainder allocation of n items across ratio buckets."""
+    ratios = np.asarray(ratios, dtype=float)
+    ratios = ratios / ratios.sum()
+    raw = n * ratios
+    counts = np.floor(raw).astype(int)
+    remainder = int(n - counts.sum())
+    if remainder > 0:
+        fractional = raw - counts
+        for i in np.argsort(-fractional)[:remainder]:
+            counts[i] += 1
+    return counts.tolist()
+
+
+def stratified_semi_supervised_split(
+    dataset,
+    seed=0,
+    labeled_ratio=0.1,
+    gap_ratio=0.1,
+    unlabeled_ratio=0.5,
+    val_ratio=0.1,
+    test_ratio=0.2,
+):
+    """Stratified split matching Exp.py slice protocol (including the 10% gap)."""
+    ratios = [labeled_ratio, gap_ratio, unlabeled_ratio, val_ratio, test_ratio]
+    if abs(sum(ratios) - 1.0) > 1e-6:
+        raise ValueError(f"split ratios must sum to 1, got {sum(ratios)}")
+
+    y = dataset.y
+    if y is None:
+        raise RuntimeError("dataset labels are required for stratified split")
+    y_np = y.detach().cpu().numpy()
+    rng = np.random.RandomState(seed)
+
+    bucket_names = ('labeled', 'gap', 'unlabeled', 'val', 'test')
+    buckets = {name: [] for name in bucket_names}
+
+    for cls in np.unique(y_np):
+        cls_idx = np.where(y_np == cls)[0]
+        rng.shuffle(cls_idx)
+        counts = _allocate_counts(len(cls_idx), ratios)
+        start = 0
+        for name, count in zip(bucket_names, counts):
+            buckets[name].extend(cls_idx[start:start + count].tolist())
+            start += count
+
+    for name in bucket_names:
+        idx = np.asarray(buckets[name], dtype=np.int64)
+        rng.shuffle(idx)
+        buckets[name] = idx
+
+    return buckets
 
 
 def k_fold(dataset, folds, seed):

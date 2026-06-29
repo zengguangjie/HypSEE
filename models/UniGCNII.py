@@ -9,7 +9,9 @@ import copy
 from sklearn.metrics import roc_auc_score as auroc
 from torch_geometric.nn.inits import glorot
 from torch_geometric.utils import softmax
+
 from utils.model_utils import select_activation
+
 
 def normalize_l2(X):
     """Row-normalize  matrix"""
@@ -21,11 +23,12 @@ def normalize_l2(X):
 
 class UniGCNIIConv(MessagePassing):
     
-    def __init__(self, in_features, out_features, **kwargs):
+    def __init__(self, in_features, out_features, eps=1e-15, **kwargs):
         super().__init__()
         kwargs.setdefault('aggr', 'add')
         kwargs.setdefault('flow', 'source_to_target')
         self.W = nn.Linear(in_features, out_features, bias=False)
+        self.eps = eps
         
     def forward(self, X, hyperedge_index, alpha, beta, X0, degV, degE, aug_weight = None, give_edge = False, edge_entry_weight = None) :
         
@@ -92,13 +95,13 @@ class UniGCNIIConv(MessagePassing):
             N = X.shape[0]
             vertex = hyperedge_index[0]
             edges = hyperedge_index[1]
-            w = edge_entry_weight.to(X.dtype).clamp_min(1e-12)
+            w = edge_entry_weight.to(X.dtype).clamp_min(self.eps)
 
             degV, degE = get_weighted_degree_of_hypergraph(hyperedge_index, w)
 
             Xve = X[vertex]  # [nnz, C]
             Xe = scatter(Xve * w.view(-1, 1), edges, dim=0, reduce='sum')  # [E, C]
-            w_sum = scatter(w, edges, dim=0, reduce='sum').clamp_min(1e-12)  # [E]
+            w_sum = scatter(w, edges, dim=0, reduce='sum').clamp_min(self.eps)  # [E]
             Xe = Xe / w_sum.view(-1, 1)
             Xe = Xe * degE
 
@@ -138,7 +141,7 @@ class UniGCNIIConv(MessagePassing):
 
 class UniGATConv(nn.Module):
 
-    def __init__(self, in_channels, out_channels, heads=8, dropout=0., negative_slope=0.2, skip_sum=False):
+    def __init__(self, in_channels, out_channels, heads=8, dropout=0., negative_slope=0.2, skip_sum=False, eps=1e-15):
         super().__init__()
         self.W = nn.Linear(in_channels, heads * out_channels, bias=False)
         
@@ -150,7 +153,7 @@ class UniGATConv(nn.Module):
         self.attn_drop  = nn.Dropout(dropout)
         self.leaky_relu = nn.LeakyReLU(negative_slope)
         self.skip_sum = skip_sum
-        # self.args = args
+        self.eps = eps
         self.reset_parameters()
 
     def __repr__(self):
@@ -176,14 +179,14 @@ class UniGATConv(nn.Module):
         X0 = self.W(X)
         X = X0.view(N, H, C)
 
-        w = None if edge_entry_weight is None else edge_entry_weight.to(X.dtype).clamp_min(1e-12)  # [nnz]
+        w = None if edge_entry_weight is None else edge_entry_weight.to(X.dtype).clamp_min(self.eps)  # [nnz]
 
         Xve = X[vertex] # [nnz, H, C]
         if w is None:
             Xe = scatter(Xve, edges, dim=0, reduce='mean') # [E, H, C]
         else:
             Xe = scatter(Xve * w.view(-1, 1, 1), edges, dim=0, reduce='sum')  # [E, H, C]
-            w_sum = scatter(w, edges, dim=0, reduce='sum').clamp_min(1e-12)  # [E]
+            w_sum = scatter(w, edges, dim=0, reduce='sum').clamp_min(self.eps)  # [E]
             Xe = Xe / w_sum.view(-1, 1, 1)
 
 

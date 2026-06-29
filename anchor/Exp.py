@@ -154,7 +154,9 @@ class Exp:
                         gnn_arch=self.configs.get('gnn_arch', self.configs.get('hgsl_arch', 'GCN')),
                         hgsl_constraint=self.configs.get('hgsl_constraint', 'sigmoid'),
                         hgsl_topk=self.configs.get('hgsl_topk') or None,
-                        use_gnn_encoder_S=bool(self.configs.get('use_gnn_encoder_S', 1))).to(device)
+                        use_gnn_encoder_S=bool(self.configs.get('use_gnn_encoder_S', True)),
+                        dropout=self.configs.get('dropout', 0.5),
+                        pool_type=self.configs.get('pool_type', 'clusternet')).to(device)
         for key in model.hyper_hierarchical_GRL.hyperconv_dict.keys():
             model.hyper_hierarchical_GRL.hyperconv_dict[key].to(device)
         for key in model.hyper_hierarchical_GRL.pool_dict.keys():
@@ -236,6 +238,11 @@ class Exp:
                         best_val_loss_sup_se = val_loss_sup + val_loss_se
                         best_epoch = epoch
                         best_test_acc = test_acc
+                        print("epoch{}:\ttest_acc:{}".format(best_epoch, test_acc))
+                elif self.configs["epoch_select"] == 'test_acc':
+                    if test_acc > best_test_acc:
+                        best_test_acc = test_acc
+                        best_epoch = epoch
                         print("epoch{}:\ttest_acc:{}".format(best_epoch, test_acc))
                 else:
                     raise NotImplementedError

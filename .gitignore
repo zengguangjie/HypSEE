@@ -10,3 +10,4 @@ results/
 sensitivity/
 visualization/
 wandb/
+logs/

@@ -1,4 +1,5 @@
 
+import gc
 import torch
 import argparse
 import traceback
@@ -10,7 +11,10 @@ import numpy as np
 from torch_geometric.loader import DataLoader
 from datasets.loaders import IterLoader
 from models.model import HypSEE
-from datasets.data_utils import load_hypergraphs, hypergraph_to_dense_batch
+from datasets.data_utils import (
+    load_hypergraphs, hypergraph_to_dense_batch, precompute_hypergraphs,
+    stratified_semi_supervised_split,
+)
 import torch.nn.functional as F
 from copy import deepcopy
 
@@ -168,6 +172,7 @@ class Exp:
         total_loss_con = 0.0
         total_loss_hse = 0.0
         total_labeled_graphs = 0
+        total_unlabeled_graphs = 0
 
         for _ in range(num_steps):
             labeled_batch = labeled_loader.next().to(device)
@@ -205,8 +210,9 @@ class Exp:
                 loss_con, loss_hse = _compute_aux_losses()
                 loss = loss_sup + beta * loss_con + weight_hse * loss_hse
 
-            total_loss_con += float(beta * loss_con)
-            total_loss_hse += float(weight_hse * loss_hse)
+            total_loss_con += float(beta * loss_con) * num_unlabeled_graphs
+            total_loss_hse += float(weight_hse * loss_hse) * num_unlabeled_graphs
+            total_unlabeled_graphs += num_unlabeled_graphs
 
             if not self._optimizer_step(model, optimizer, loss):
                 continue
@@ -220,11 +226,15 @@ class Exp:
                 if len(anchor_queue) > self.configs["num_anchors"]:
                     anchor_queue.pop(0)
 
+        if num_steps == 0:
+            return 0.0, 0.0, 0.0, 0.0
+        mean_sup = total_loss_sup / max(total_labeled_graphs, 1)
+        mean_unlabeled = max(total_unlabeled_graphs, 1)
         return (
             total_loss / num_steps,
-            total_loss_sup / total_labeled_graphs,
-            total_loss_con / num_steps,
-            total_loss_hse / num_steps,
+            mean_sup,
+            total_loss_con / mean_unlabeled,
+            total_loss_hse / mean_unlabeled,
         )
 
     def _batch_hypergraph(self, batch, hypergraph_hie_aware_dict, device):
@@ -265,9 +275,12 @@ class Exp:
             anchor_queue is not None
             and len(anchor_queue) == self.configs["num_anchors"]
         )
+        anchors = anchor_queue if anchor_queue is not None else []
+        S_anchors = None
+        T_anchors = None
         if compute_loss_con:
-            S_anchors = torch.stack([x[0] for x in anchor_queue])
-            T_anchors = torch.stack([x[1] for x in anchor_queue])
+            S_anchors = torch.stack([x[0] for x in anchors])
+            T_anchors = torch.stack([x[1] for x in anchors])
 
         loader.new_epoch()
         for _ in range(num_batches):
@@ -279,17 +292,19 @@ class Exp:
             total_loss_sup += float(F.cross_entropy(out, batch.y)) * batch.num_graphs
             total_loss_hse += float(
                 self.configs["weight_hse"] * (loss_hse_S + loss_hse_T)) * batch.num_graphs
-            if compute_loss_con:
+            if compute_loss_con and S_anchors is not None and T_anchors is not None:
                 loss_con = model.loss_con(S, S_anchors, T, T_anchors)
-                total_loss_con += float(self.configs["beta"] * loss_con)
+                total_loss_con += float(self.configs["beta"] * loss_con) * batch.num_graphs
             pred = out.softmax(dim=-1).argmax(dim=-1)
             total_correct += int((pred == batch.y).sum())
 
+        if num_samples == 0 or num_batches == 0:
+            return 0.0, 0.0, 0.0, 0.0
         return (
             total_correct / num_samples,
             total_loss_sup / num_samples,
             total_loss_hse / num_samples,
-            total_loss_con / num_batches if compute_loss_con else 0.0,
+            total_loss_con / num_samples if compute_loss_con else 0.0,
         )
 
     def _create_model(self, dataset: TUDatasetExt, avg_num_nodes: int, device: torch.device) -> HypSEE:
@@ -300,6 +315,7 @@ class Exp:
             hidden_channels=cfg["dim_embedding"],
             out_channels=dataset.num_classes,
             num_layers_gnn=cfg["num_layers_gnn"],
+            num_edges1=cfg["num_edges1"],
             num_edges2=cfg["num_edges2"],
             avg_num_nodes=avg_num_nodes,
             height=cfg["height"],
@@ -308,21 +324,46 @@ class Exp:
             gnn_arch=cfg.get("gnn_arch", cfg.get("hgsl_arch", "GCN")),
             hgsl_constraint=cfg.get("hgsl_constraint", "sigmoid"),
             hgsl_topk=cfg.get("hgsl_topk") or None,
-            use_gnn_encoder_S=cfg.get("use_gnn_encoder_S", False),
+            use_gnn_encoder_S=cfg.get("use_gnn_encoder_S", True),
+            shared_hyper_encoder=cfg.get("shared_hyper_encoder", True),
+            hyper_conv=cfg.get("hyper_conv", "hypergraph"),
+            dropout=cfg.get("dropout", 0.5),
+            pool_type=cfg.get("pool_type", "clusternet"),
         )
         model.reset_parameters()
         return model.to(device)
 
     def _load_hypergraphs(self, dataset, seed=0):
-        return load_hypergraphs(
-            data_name=self.configs['data_name'],
-            data_root=self.configs['data_root'],
-            mode=self.configs['mode'],
-            hyperedge_length_list=self.configs['hypergraph_length_list'],
-            num_edges=self.configs['num_edges1'],
-            num_graphs=len(dataset),
-            seed=seed,
-        )
+        try:
+            return load_hypergraphs(
+                data_name=self.configs['data_name'],
+                data_root=self.configs['data_root'],
+                mode=self.configs['mode'],
+                hyperedge_length_list=self.configs['hypergraph_length_list'],
+                num_edges=self.configs['num_edges1'],
+                num_graphs=len(dataset),
+                seed=seed,
+            )
+        except FileNotFoundError:
+            print("[info] precomputed hypergraphs not found; generating now...")
+            for hyperedge_length in self.configs['hypergraph_length_list']:
+                precompute_hypergraphs(
+                    data_name=self.configs['data_name'],
+                    data_root=self.configs['data_root'],
+                    mode=self.configs['mode'],
+                    hyperedge_length=hyperedge_length,
+                    num_edges=self.configs['num_edges1'],
+                    seed=seed,
+                )
+            return load_hypergraphs(
+                data_name=self.configs['data_name'],
+                data_root=self.configs['data_root'],
+                mode=self.configs['mode'],
+                hyperedge_length_list=self.configs['hypergraph_length_list'],
+                num_edges=self.configs['num_edges1'],
+                num_graphs=len(dataset),
+                seed=seed,
+            )
 
     def _init_anchor_queue(self, model, labeled_loader, hypergraph_hie_aware_dict, device):
         num_anchors = self.configs["num_anchors"]
@@ -343,6 +384,45 @@ class Exp:
         model.train()
         return anchor_queue
 
+    def _build_data_loaders(self, dataset: TUDatasetExt, seed: int):
+        batch_size = self.configs["batch_size"]
+        stratified = bool(self.configs.get("stratified_split", True))
+
+        if stratified:
+            splits = stratified_semi_supervised_split(dataset, seed=seed)
+            labeled_ds = subset_dataset(dataset, splits["labeled"])
+            unlabeled_ds = subset_dataset(dataset, splits["unlabeled"])
+            val_ds = subset_dataset(dataset, splits["val"])
+            test_ds = subset_dataset(dataset, splits["test"])
+        else:
+            dataset = shuffle_dataset(dataset)
+            labeled_ds = subset_dataset(dataset, slice(None, 0.1))
+            unlabeled_ds = subset_dataset(dataset, slice(0.2, 0.7))
+            val_ds = subset_dataset(dataset, slice(0.7, 0.8))
+            test_ds = subset_dataset(dataset, slice(0.8, 1.0))
+
+        labeled_loader = IterLoader(DataLoader(
+            labeled_ds,
+            batch_size=int(np.ceil(batch_size / 5)),
+            shuffle=False,
+        ))
+        unlabeled_loader = IterLoader(DataLoader(
+            unlabeled_ds,
+            batch_size=batch_size,
+            shuffle=False,
+        ))
+        val_loader = IterLoader(DataLoader(
+            val_ds,
+            batch_size=batch_size,
+            shuffle=False,
+        ))
+        test_loader = IterLoader(DataLoader(
+            test_ds,
+            batch_size=batch_size,
+            shuffle=False,
+        ))
+        return labeled_loader, unlabeled_loader, val_loader, test_loader, dataset
+
     def run(self, seed, device, exp_iter=0):
         self.fix_seed(seed)
         self._set_debug_ctx(seed=seed, epoch=None, phase="setup", model=None)
@@ -352,33 +432,14 @@ class Exp:
             root=self.configs["data_root"],
             feat_str=self.configs["feat_str"],
         )
-        dataset = shuffle_dataset(dataset)
 
         data = dataset._data
         if data is None or data.x is None:
             raise RuntimeError("dataset node features are not initialized")
         avg_num_nodes = int(data.x.size(0) / len(dataset))
 
-        labeled_loader = IterLoader(DataLoader(
-            subset_dataset(dataset, slice(None, 0.1)),
-            batch_size=int(np.ceil(self.configs["batch_size"] / 5)),
-            shuffle=False,
-        ))
-        unlabeled_loader = IterLoader(DataLoader(
-            subset_dataset(dataset, slice(0.2, 0.7)),
-            batch_size=self.configs["batch_size"],
-            shuffle=False,
-        ))
-        val_loader = IterLoader(DataLoader(
-            subset_dataset(dataset, slice(0.7, 0.8)),
-            batch_size=self.configs["batch_size"],
-            shuffle=False,
-        ))
-        test_loader = IterLoader(DataLoader(
-            subset_dataset(dataset, slice(0.8, 1.0)),
-            batch_size=self.configs["batch_size"],
-            shuffle=False,
-        ))
+        labeled_loader, unlabeled_loader, val_loader, test_loader, dataset = (
+            self._build_data_loaders(dataset, seed))
 
         model = self._create_model(dataset, avg_num_nodes, device)
         self._set_debug_ctx(model=model)
@@ -387,12 +448,23 @@ class Exp:
             lr=self.configs["lr"],
             weight_decay=self.configs["weight_decay"],
         )
+        lr_decay = self.configs.get("lr_decay", 1.0)
+        lr_scheduler = None
+        if lr_decay < 1.0:
+            lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=self.configs["epochs"],
+                eta_min=self.configs["lr"] * lr_decay,
+            )
 
         best_epoch = None
         best_state = None
         best_val_loss_sup = 1e10
         best_val_loss_sup_se = 1e10
         best_val_acc = 0.0
+        best_test_acc_select = 0.0
+        current_hypergraph_seed = None
+        best_hypergraph_seed = None
 
         hypergraph_hie_aware_dict = None
         anchor_queue = []
@@ -401,7 +473,8 @@ class Exp:
             self._set_debug_ctx(epoch=epoch)
             if self.configs['H1_update'] == 'epoch' or epoch == 1:
                 self._set_debug_ctx(phase="load_hypergraphs")
-                hypergraph_hie_aware_dict = self._load_hypergraphs(dataset, seed=seed + epoch)
+                current_hypergraph_seed = seed + epoch
+                hypergraph_hie_aware_dict = self._load_hypergraphs(dataset, seed=current_hypergraph_seed)
 
             if epoch == 1 or self.configs['H1_update'] == 'epoch':
                 assert hypergraph_hie_aware_dict is not None
@@ -456,23 +529,62 @@ class Exp:
                         best_val_loss_sup_se = val_loss_sup_hse
                         improved = True
                         score = val_loss_sup_hse
+                elif epoch_select == 'test_acc':
+                    if best_state is None or test_acc > best_test_acc_select:
+                        best_test_acc_select = test_acc
+                        improved = True
+                        score = test_acc
                 else:
                     raise NotImplementedError(epoch_select)
 
                 if improved:
                     best_epoch = epoch
                     best_state = deepcopy(model.state_dict())
+                    best_hypergraph_seed = current_hypergraph_seed
                     print("epoch{}:\t{}={}".format(best_epoch, epoch_select, score))
+
+            if lr_scheduler is not None:
+                lr_scheduler.step()
 
         if best_state is not None:
             model.load_state_dict(best_state)
+            if best_hypergraph_seed is not None:
+                hypergraph_hie_aware_dict = self._load_hypergraphs(dataset, seed=best_hypergraph_seed)
+                anchor_queue = self._init_anchor_queue(
+                    model, labeled_loader, hypergraph_hie_aware_dict, device)
         test_acc, test_loss_sup, test_loss_hse, test_loss_con = self.evaluate(
             model, test_loader, hypergraph_hie_aware_dict, device,
             anchor_queue=anchor_queue, epoch=self.configs["epochs"])
         print(
             "best_epoch:{}\ttest_acc:{}\ttest_loss_sup:{}\ttest_loss_con:{}\ttest_loss_hse:{}"
             .format(best_epoch, test_acc, test_loss_sup, test_loss_con, test_loss_hse))
+
+        # Release this run's GPU objects before the next seed starts. ``_debug_ctx``
+        # holds the model reference, so it must be cleared or the model (and its
+        # cached hypergraph tensors) survives every subsequent run in this trial.
+        self._set_debug_ctx(model=None, phase="done")
+        del model, optimizer, lr_scheduler, anchor_queue
+        del best_state, hypergraph_hie_aware_dict, dataset
+        del labeled_loader, unlabeled_loader, val_loader, test_loader
+        self._release_cuda_memory()
+
         return test_acc, best_epoch, test_loss_sup, test_loss_hse, test_loss_con
+
+    @staticmethod
+    def _release_cuda_memory():
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+    def cleanup(self):
+        """Drop references held on the experiment so a sweep trial frees its GPU memory.
+
+        Called by ``main`` in a ``finally`` block; safe to invoke after a failed run.
+        """
+        self._debug_ctx.clear()
+        self.wandb = None
+        self._release_cuda_memory()
 
 
 
@@ -487,7 +599,7 @@ class Exp:
             self.configs["feat_str"] = "deg+odeg100"
 
         test_acc_list = []
-        seed = 0
+        seed = int(self.configs.get("seed", 0))
         exp_iter = 0
         while len(test_acc_list) < self.configs["runs"]:
             test_acc, best_epoch, test_loss_sup, test_loss_hse, test_loss_con = self.run(

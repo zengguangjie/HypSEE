@@ -2,8 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-EPS = 1e-8
-
 
 def _assert_finite(name: str, tensor: torch.Tensor) -> None:
     if torch.isfinite(tensor).all():
@@ -20,7 +18,7 @@ def _assert_finite(name: str, tensor: torch.Tensor) -> None:
     )
 
 class HGNNConvDense(nn.Module):
-    def __init__(self, in_channels, out_channels, bias=True, use_bn=False, drop_rate=0.5, is_last=False, sym_D=False):
+    def __init__(self, in_channels, out_channels, bias=True, use_bn=False, drop_rate=0.5, is_last=False, sym_D=False, eps=1e-15):
         super().__init__()
         self.is_last = is_last
         self.bn = nn.BatchNorm1d(out_channels) if use_bn else None
@@ -28,6 +26,7 @@ class HGNNConvDense(nn.Module):
         self.drop = nn.Dropout(drop_rate)
         self.theta = nn.Linear(in_channels, out_channels, bias=bias)
         self.sym_D = sym_D  # if sym_D, then D is calculated as D = HWH^T.diagonal()
+        self.eps = eps
 
     def forward_denseWDB(self, X, H, W, D=None, B=None, mask=None):
         assert torch.all(H>=0)
@@ -51,7 +50,7 @@ class HGNNConvDense(nn.Module):
         # D_inv = 1.0 / D.clamp(EPS)
 
         # D_invsqrt = eye / (torch.sqrt(D.clamp(1e-15)) + EPS)
-        D_invsqrt = eye / (torch.sqrt(D) + EPS)
+        D_invsqrt = eye / (torch.sqrt(D) + self.eps)
         D_invsqrt = D_invsqrt * mask
         D_invsqrt[D_invsqrt == float("inf")] = 0
 
@@ -60,7 +59,7 @@ class HGNNConvDense(nn.Module):
             B = torch.ones([bs, _num_e, _num_v]).to(X.device).matmul(H)
         eye = torch.eye(_num_e).unsqueeze(0).repeat(bs, 1, 1).to(H.dtype).to(H.device)
         # B_inv = 1.0 / B.clamp(EPS)
-        B_inv = eye / (B + EPS)
+        B_inv = eye / (B + self.eps)
         B_inv[B_inv == float("inf")] = 0
         # print(torch.min(B_inv), torch.max(B_inv), "B_inv")
         # X = X * mask
@@ -106,13 +105,13 @@ class HGNNConvDense(nn.Module):
         assert not (D<0).any()
         assert not torch.isnan(D).any()
         # assert (D>=0).all()
-        D_invsqrt = torch.ones_like(D) / (torch.sqrt(D) + EPS)
+        D_invsqrt = torch.ones_like(D) / (torch.sqrt(D) + self.eps)
         D_invsqrt = D_invsqrt * mask.squeeze(-1)
         D_invsqrt[D_invsqrt == float("inf")] = 0
 
         if B is None:
             B = torch.einsum('bij->bj', H)  # b*k
-        B_inv = torch.ones_like(B) / (B + EPS)
+        B_inv = torch.ones_like(B) / (B + self.eps)
         B_inv[B_inv == float("inf")] = 0
 
         X = self.theta(X) # b*n*d
@@ -132,7 +131,7 @@ class HGNNConvDense(nn.Module):
         return Z
 
 class HGNN_HEAL(nn.Module):
-    def __init__(self, num_edges, in_channels, bias=True, use_bn=False, drop_rate=0.5, is_last=False, sym_D=False, act2=False):
+    def __init__(self, num_edges, in_channels, bias=True, use_bn=False, drop_rate=0.5, is_last=False, sym_D=False, act2=False, eps=1e-15):
         super().__init__()
         # out_channels = in_channels
         self.is_last = is_last
@@ -142,6 +141,7 @@ class HGNN_HEAL(nn.Module):
         self.theta = nn.Linear(num_edges, num_edges, bias=bias)
         self.sym_D = sym_D  # if sym_D, then D is calculated as D = HWH^T.diagonal()
         self.act2 = nn.ReLU(inplace=True) if act2 else None
+        self.eps = eps
 
     def forward(self, X, H, W=None, D=None, B=None, mask=None):
 
@@ -160,8 +160,8 @@ class HGNN_HEAL(nn.Module):
                 D = torch.einsum('bii->bi', D)
             else:
                 D = torch.einsum('bij,bj->bi', H, W)
-        D = D.clamp(min=EPS)
-        D_invsqrt = torch.ones_like(D) / (torch.sqrt(D) + EPS)
+        D = D.clamp(min=self.eps)
+        D_invsqrt = torch.ones_like(D) / (torch.sqrt(D) + self.eps)
         D_invsqrt = D_invsqrt * mask.squeeze(-1)
         D_invsqrt[D_invsqrt == float("inf")] = 0
 
@@ -169,8 +169,8 @@ class HGNN_HEAL(nn.Module):
 
         if B is None:
             B = torch.einsum('bij->bj', H)  # b*k
-        B = B.clamp(min=EPS)
-        B_inv = torch.ones_like(B) / (B + EPS)
+        B = B.clamp(min=self.eps)
+        B_inv = torch.ones_like(B) / (B + self.eps)
         B_inv[B_inv == float("inf")] = 0
 
         _assert_finite("HGNN_HEAL.B_inv", B_inv)

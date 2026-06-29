@@ -4,7 +4,8 @@ from torch_geometric.utils import to_dense_batch, is_undirected, to_dense_adj
 from torch.nn import Linear, Parameter, ReLU, Sequential, BatchNorm1d as BN
 import torch.nn.functional as F
 # from hypergraph_conv import HypergraphConv
-from models.hgnn_conv import HGNNConvDense, HGNNConv, HGNN_HEAL
+from models.hgnn import HYPERCONV_CHOICES, build_hyperconv_layer
+from models.ClusterNet import ClusterNetPoolLayer, LinearPoolLayer, UniGATPoolLayer
 from math import ceil
 import math
 from torch_geometric.nn.models import GCN
@@ -13,7 +14,30 @@ from torch_scatter import scatter_sum
 
 # EPS = 1e-15
 
-CONSTRAINT_CHOICES = ('sigmoid', 'softplus', 'relu', 'topk', 'none')
+CONSTRAINT_CHOICES = ('sigmoid', 'softplus', 'relu', 'topk')
+POOL_CHOICES = ('linear', 'clusternet', 'unigat')
+
+
+def build_pool_layer(
+    name: str,
+    hidden_channels: int,
+    num_clusters: int,
+    *,
+    num_iter: int = 1,
+    dropout: float = 0.5,
+    eps: float = 1e-15,
+) -> torch.nn.Module:
+    """Factory for hierarchical pool layers used in HyperHierarchicalGRL."""
+    name = name.lower()
+    if name == 'linear':
+        return LinearPoolLayer(hidden_channels, num_clusters, num_iter=num_iter)
+    if name == 'clusternet':
+        return ClusterNetPoolLayer(
+            hidden_channels, num_clusters, num_iter=num_iter, eps=eps)
+    if name == 'unigat':
+        return UniGATPoolLayer(
+            hidden_channels, num_clusters, num_iter=num_iter, dropout=dropout, eps=eps)
+    raise ValueError(f"pool_type must be one of {POOL_CHOICES}, got {name!r}")
 
 
 class HyperStructLearning(torch.nn.Module):
@@ -60,11 +84,18 @@ class HyperStructLearning(torch.nn.Module):
 
 class HyperHierarchicalGRL(torch.nn.Module):
     def __init__(self, hidden_channels, avg_num_nodes, num_edges=None, height=3, decay_rate=0.5,
-                 sym_D=False, EPS=1e-15, act2=True):
+                 sym_D=False, EPS=1e-15, act2=True, hyper_conv='hypergraph', pool_num_iter=1,
+                 dropout=0.5, pool_type='clusternet'):
         super(HyperHierarchicalGRL, self).__init__()
+
+        if pool_type not in POOL_CHOICES:
+            raise ValueError(
+                f"pool_type must be one of {POOL_CHOICES}, got {pool_type!r}")
 
         self.height = height
         self.EPS = EPS
+        self.hyper_conv = hyper_conv
+        self.pool_type = pool_type
 
         hyperconv_dict = torch.nn.ModuleDict()
         pool_dict = torch.nn.ModuleDict()
@@ -72,10 +103,33 @@ class HyperHierarchicalGRL(torch.nn.Module):
 
         for k in range(self.height, 1, -1):
             key = str(k)
-            hyperconv_dict[key] = HGNN_HEAL(num_edges, hidden_channels, act2=act2)
+            hyperconv_dict[key] = build_hyperconv_layer(
+                hyper_conv,
+                hidden_channels,
+                hidden_channels,
+                num_edges=num_edges,
+                act2=act2,
+                drop_rate=dropout,
+                eps=EPS,
+            )
             num_nodes = ceil(decay_rate * num_nodes)
-            pool_dict[key] = Linear(hidden_channels, num_nodes)
-        hyperconv_dict['1'] = HGNN_HEAL(num_edges, hidden_channels, act2=act2)
+            pool_dict[key] = build_pool_layer(
+                pool_type,
+                hidden_channels,
+                num_nodes,
+                num_iter=pool_num_iter,
+                dropout=dropout,
+                eps=EPS,
+            )
+        hyperconv_dict['1'] = build_hyperconv_layer(
+            hyper_conv,
+            hidden_channels,
+            hidden_channels,
+            num_edges=num_edges,
+            act2=act2,
+            drop_rate=dropout,
+            eps=EPS,
+        )
         self.hyperconv_dict = hyperconv_dict
         self.pool_dict = pool_dict
 
@@ -94,6 +148,10 @@ class HyperHierarchicalGRL(torch.nn.Module):
         assert H.dim() == 3  # b*n*k
         assert W.dim() == 2  # b*k
         assert mask.dim() == 2  # b*n
+        # Drop the previous forward's cached tensors so we never hold two batches'
+        # autograd graphs on the module at once.
+        self.clu_mat.clear()
+        self.vol_dict.clear()
         H_input = H
 
         for k in range(self.height, 1, -1):
@@ -110,7 +168,7 @@ class HyperHierarchicalGRL(torch.nn.Module):
                 D = torch.einsum('bij,bj->bi', H, W)
             D = D.clamp(min=self.EPS)
             Z = self._hyperconv(k, X, H, W, D, mask)
-            C = self.pool_dict[str(k)](Z)  # b*n_h*n_h-1
+            C = self.pool_dict[str(k)](Z, H=H, W=W, D=D, mask=mask, tau=temp)
             C = torch.softmax(C / temp, dim=-1)
             H = C.transpose(-1, -2).matmul(H)
             X = C.transpose(-1, -2).matmul(Z)
@@ -140,6 +198,10 @@ class HyperHierarchicalGRL(torch.nn.Module):
         # Z = torch.sum(Z, dim=-2)
         Z = torch.mean(Z, dim=-2)
         loss_hse = self.hse_loss(H_input, W, 1e-10)
+        # ``hse_loss`` is the only consumer of these caches; release the module-level
+        # references now so the graph tensors can be freed right after backward().
+        self.clu_mat.clear()
+        self.vol_dict.clear()
         return Z, loss_hse
 
     def hse_loss(self, H, W, EPS):

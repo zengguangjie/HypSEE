@@ -127,15 +127,17 @@ def edge_pert(data, aug_ratio):
     node_num, _ = data.x.size()
     _, edge_num = data.edge_index.size()
     pert_num = int(edge_num * aug_ratio)
+    device = data.edge_index.device
 
     edge_index = data.edge_index[
         :, np.random.choice(edge_num, edge_num - pert_num, replace=False)
     ]
     idx_add = np.random.choice(node_num, (2, pert_num))
-    adj = torch.zeros((node_num, node_num))
+    adj = torch.zeros((node_num, node_num), device=device)
     adj[edge_index[0], edge_index[1]] = 1
-    adj[idx_add[0], idx_add[1]] = 1
-    adj[np.arange(node_num), np.arange(node_num)] = 0
+    idx_add_t = torch.as_tensor(idx_add, device=device)
+    adj[idx_add_t[0], idx_add_t[1]] = 1
+    adj.fill_diagonal_(0)
     data.edge_index = adj.nonzero(as_tuple=False).t()
     data.num_nodes, _ = data.x.shape
     return data
@@ -181,17 +183,24 @@ def attr_mask(data, aug_ratio):
     return data
 
 
+def maskN_permE(data, aug_ratio):
+    data = attr_mask(data, aug_ratio)
+    return edge_pert(data, aug_ratio)
+
+
 _AUGMENTATIONS = {
     "dropN": node_drop,
     "permE": edge_pert,
     "subgraph": subgraph,
     "maskN": attr_mask,
+    "maskN_permE": maskN_permE,
 }
 
 _RANDOM_AUGMENTATIONS = {
     "random2": (node_drop, subgraph),
     "random3": (node_drop, subgraph, edge_pert),
     "random4": (node_drop, subgraph, edge_pert, attr_mask),
+    "random_mask_permE": (attr_mask, edge_pert),
 }
 
 
@@ -216,7 +225,8 @@ def augment_batch(batch, aug, aug_ratio, npower=1.0):
         return batch
     from torch_geometric.data import Batch
 
-    data_list = batch.to_data_list()
+    # Augment on CPU: several augs build new tensors without preserving device.
+    data_list = [data.cpu() for data in batch.to_data_list()]
     aug_list = [
         apply_augmentation(copy.deepcopy(data), aug, aug_ratio, npower)
         for data in data_list

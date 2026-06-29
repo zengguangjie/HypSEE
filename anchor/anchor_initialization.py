@@ -41,7 +41,8 @@ parser.add_argument('--warm_epochs', type=int, default=2)
 # parser.add_argument('--num_edges1', type=int, default=32, help='number of hyperedges per handcrafted hypergraph')
 # parser.add_argument('--mode', type=str, default='RW', choices=['RW', 'HOP'])
 # parser.add_argument('--dense', type=bool, default=False, help='whether to use dense implementation for gnn and hgnn from the beginning')
-parser.add_argument('--epoch_select', type=str, default='val_loss_sup', choices=['val_acc', 'val_loss_sup', 'val_loss_sup_hse'])
+parser.add_argument('--epoch_select', type=str, default='val_loss_sup',
+                    choices=['val_acc', 'val_acc_eq', 'val_loss_sup', 'val_loss_sup_hse', 'test_acc'])
 parser.add_argument('--runs', type=int, default=5)
 parser.add_argument('--feat_str', type=str, default='')
 parser.add_argument('--height', type=int, default=3)
@@ -51,9 +52,13 @@ parser.add_argument('--T2', type=float, default=1.0, help='temperature for fix_m
 parser.add_argument('--threshold', type=float, default=0.95, help='threshold for fix_match loss')
 parser.add_argument('--weight_fix', type=float, default=1)
 parser.add_argument('--weight_simlr', type=float, default=1)
-parser.add_argument('--aug1', type=str, default='none', choices=['dropN', 'wdropN', 'permE', 'subgraph', 'maskN', 'none', 'random4', 'random3', 'random2'])
+parser.add_argument('--aug1', type=str, default='none',
+                    choices=['dropN', 'wdropN', 'permE', 'subgraph', 'maskN', 'maskN_permE',
+                             'none', 'random4', 'random3', 'random2', 'random_mask_permE'])
 parser.add_argument('--aug_ratio1', type=float, default=0.2)
-parser.add_argument('--aug2', type=str, default='none', choices=['dropN', 'wdropN', 'permE', 'subgraph', 'maskN', 'none', 'random4', 'random3', 'random2'])
+parser.add_argument('--aug2', type=str, default='none',
+                    choices=['dropN', 'wdropN', 'permE', 'subgraph', 'maskN', 'maskN_permE',
+                             'none', 'random4', 'random3', 'random2', 'random_mask_permE'])
 parser.add_argument('--aug_ratio2', type=float, default=0.2)
 parser.add_argument('--EPS', type=float, default=1e-15)
 parser.add_argument('--decay_rate', type=float, default=0.5)
