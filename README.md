@@ -37,7 +37,7 @@ cat logs/sweep_registry.log
 ### Template
 
 ```bash
-DATASET="PROTEINS"
+DATASET="DD"
 SWEEP_TAG="base_v0628"          # custom suffix; sweep_name = <dataset>_<tag>
 SWEEP_NAME="${DATASET}_${SWEEP_TAG}"
 

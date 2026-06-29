@@ -23,6 +23,7 @@ class Exp:
     def __init__(self, configs):
         self.configs = configs
         self._debug_ctx: dict[str, Any] = {}
+        self._hg_dense_cache: HypergraphDenseBatchCache | None = None
         self.wandb = None
         if configs.get("use_wandb"):
             import wandb
@@ -432,154 +433,170 @@ class Exp:
         self.fix_seed(seed)
         self._set_debug_ctx(seed=seed, epoch=None, phase="setup", model=None)
 
-        dataset: TUDatasetExt = get_dataset(
-            name=self.configs["data_name"],
-            root=self.configs["data_root"],
-            feat_str=self.configs["feat_str"],
-        )
-
-        data = dataset._data
-        if data is None or data.x is None:
-            raise RuntimeError("dataset node features are not initialized")
-        avg_num_nodes = int(data.x.size(0) / len(dataset))
-
-        labeled_loader, unlabeled_loader, val_loader, test_loader, dataset = (
-            self._build_data_loaders(dataset, seed))
-
-        model = self._create_model(dataset, avg_num_nodes, device)
-        self._set_debug_ctx(model=model)
-        optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=self.configs["lr"],
-            weight_decay=self.configs["weight_decay"],
-        )
-        lr_decay = self.configs.get("lr_decay", 1.0)
+        dataset = None
+        model = None
+        optimizer = None
         lr_scheduler = None
-        if lr_decay < 1.0:
-            lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=self.configs["epochs"],
-                eta_min=self.configs["lr"] * lr_decay,
-            )
-
-        best_epoch = None
-        best_state = None
-        best_val_loss_sup = 1e10
-        best_val_loss_sup_se = 1e10
-        best_val_acc = 0.0
-        best_test_acc_select = 0.0
-        current_hypergraph_seed = None
-        best_hypergraph_seed = None
-
         hypergraph_hie_aware_dict = None
         anchor_queue = []
-        self._hg_dense_cache = HypergraphDenseBatchCache()
+        labeled_loader = unlabeled_loader = val_loader = test_loader = None
+        best_state = None
+        result = None
 
-        for epoch in range(1, self.configs["epochs"] + 1):
-            self._set_debug_ctx(epoch=epoch)
-            if self.configs['H1_update'] == 'epoch' or epoch == 1:
-                self._set_debug_ctx(phase="load_hypergraphs")
-                current_hypergraph_seed = seed + epoch
-                hypergraph_hie_aware_dict = self._load_hypergraphs(dataset, seed=current_hypergraph_seed)
-                self._hg_dense_cache.set_version(current_hypergraph_seed)
+        try:
+            dataset = get_dataset(
+                name=self.configs["data_name"],
+                root=self.configs["data_root"],
+                feat_str=self.configs["feat_str"],
+            )
 
-            if epoch == 1 or self.configs['H1_update'] == 'epoch':
+            data = dataset._data
+            if data is None or data.x is None:
+                raise RuntimeError("dataset node features are not initialized")
+            avg_num_nodes = int(data.x.size(0) / len(dataset))
+
+            labeled_loader, unlabeled_loader, val_loader, test_loader, dataset = (
+                self._build_data_loaders(dataset, seed))
+
+            model = self._create_model(dataset, avg_num_nodes, device)
+            self._set_debug_ctx(model=model)
+            optimizer = torch.optim.Adam(
+                model.parameters(),
+                lr=self.configs["lr"],
+                weight_decay=self.configs["weight_decay"],
+            )
+            lr_decay = self.configs.get("lr_decay", 1.0)
+            if lr_decay < 1.0:
+                lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    T_max=self.configs["epochs"],
+                    eta_min=self.configs["lr"] * lr_decay,
+                )
+
+            best_epoch = None
+            best_val_loss_sup = 1e10
+            best_val_loss_sup_se = 1e10
+            best_val_acc = 0.0
+            best_test_acc_select = 0.0
+            current_hypergraph_seed = None
+            best_hypergraph_seed = None
+
+            self._hg_dense_cache = HypergraphDenseBatchCache()
+
+            for epoch in range(1, self.configs["epochs"] + 1):
+                self._set_debug_ctx(epoch=epoch)
+                if self.configs['H1_update'] == 'epoch' or epoch == 1:
+                    self._set_debug_ctx(phase="load_hypergraphs")
+                    current_hypergraph_seed = seed + epoch
+                    hypergraph_hie_aware_dict = self._load_hypergraphs(dataset, seed=current_hypergraph_seed)
+                    self._hg_dense_cache.set_version(current_hypergraph_seed)
+
+                if epoch == 1 or self.configs['H1_update'] == 'epoch':
+                    assert hypergraph_hie_aware_dict is not None
+                    self._set_debug_ctx(phase="init_anchor_queue")
+                    anchor_queue = self._init_anchor_queue(
+                        model, labeled_loader, hypergraph_hie_aware_dict, device)
+
                 assert hypergraph_hie_aware_dict is not None
-                self._set_debug_ctx(phase="init_anchor_queue")
-                anchor_queue = self._init_anchor_queue(
-                    model, labeled_loader, hypergraph_hie_aware_dict, device)
+                self._set_debug_ctx(phase="train")
+                train_loss, train_loss_sup, train_loss_con, train_loss_se = self.train(model, labeled_loader,
+                                                                                  unlabeled_loader, hypergraph_hie_aware_dict,
+                                                                                  optimizer, anchor_queue, epoch, device)
+                self._set_debug_ctx(phase="evaluate")
+                val_acc, val_loss_sup, val_loss_se, val_loss_con = self.evaluate(
+                    model, val_loader, hypergraph_hie_aware_dict, device,
+                    anchor_queue=anchor_queue, epoch=epoch)
+                test_acc, test_loss_sup, test_loss_hse, test_loss_con = self.evaluate(
+                    model, test_loader, hypergraph_hie_aware_dict, device,
+                    anchor_queue=anchor_queue, epoch=epoch)
+                print(
+                    "epoch{}:\ttrain loss: {}\ttrain_sup loss: {}\ttrain_con loss: {}\ttrain_hse loss: {}\t"
+                    "val_acc: {}\ttest_acc: {}"
+                    .format(epoch, train_loss, train_loss_sup, train_loss_con, train_loss_se, val_acc, test_acc))
+                self._log_wandb_train(
+                    epoch, exp_iter, train_loss, train_loss_sup, train_loss_con, train_loss_se)
+                self._log_wandb_eval(
+                    epoch, exp_iter, val_acc, val_loss_sup, val_loss_se, val_loss_con)
+                self._log_wandb_test_epoch(
+                    epoch, exp_iter, test_acc, test_loss_sup, test_loss_hse, test_loss_con)
+                if epoch > self.configs["warm_epochs"]:
+                    epoch_select = self.configs["epoch_select"]
+                    improved = False
+                    score = 0.0
+                    if epoch_select == 'val_loss_sup':
+                        if best_state is None or val_loss_sup < best_val_loss_sup:
+                            best_val_loss_sup = val_loss_sup
+                            improved = True
+                            score = val_loss_sup
+                    elif epoch_select == 'val_acc':
+                        if best_state is None or val_acc > best_val_acc:
+                            best_val_acc = val_acc
+                            improved = True
+                            score = val_acc
+                    elif epoch_select == 'val_acc_eq':
+                        if best_state is None or val_acc >= best_val_acc:
+                            best_val_acc = val_acc
+                            improved = True
+                            score = val_acc
+                    elif epoch_select == 'val_loss_sup_hse':
+                        val_loss_sup_hse = val_loss_sup + val_loss_se
+                        if best_state is None or val_loss_sup_hse < best_val_loss_sup_se:
+                            best_val_loss_sup_se = val_loss_sup_hse
+                            improved = True
+                            score = val_loss_sup_hse
+                    elif epoch_select == 'test_acc':
+                        if best_state is None or test_acc > best_test_acc_select:
+                            best_test_acc_select = test_acc
+                            improved = True
+                            score = test_acc
+                    else:
+                        raise NotImplementedError(epoch_select)
 
-            assert hypergraph_hie_aware_dict is not None
-            self._set_debug_ctx(phase="train")
-            train_loss, train_loss_sup, train_loss_con, train_loss_se = self.train(model, labeled_loader,
-                                                                              unlabeled_loader, hypergraph_hie_aware_dict,
-                                                                              optimizer, anchor_queue, epoch, device)
-            self._set_debug_ctx(phase="evaluate")
-            val_acc, val_loss_sup, val_loss_se, val_loss_con = self.evaluate(
-                model, val_loader, hypergraph_hie_aware_dict, device,
-                anchor_queue=anchor_queue, epoch=epoch)
+                    if improved:
+                        best_epoch = epoch
+                        best_state = deepcopy(model.state_dict())
+                        best_hypergraph_seed = current_hypergraph_seed
+                        print("epoch{}:\t{}={}".format(best_epoch, epoch_select, score))
+
+                if lr_scheduler is not None:
+                    lr_scheduler.step()
+
+            if best_state is not None:
+                model.load_state_dict(best_state)
+                if best_hypergraph_seed is not None:
+                    hypergraph_hie_aware_dict = self._load_hypergraphs(dataset, seed=best_hypergraph_seed)
+                    self._hg_dense_cache.set_version(best_hypergraph_seed)
+                    anchor_queue = self._init_anchor_queue(
+                        model, labeled_loader, hypergraph_hie_aware_dict, device)
             test_acc, test_loss_sup, test_loss_hse, test_loss_con = self.evaluate(
                 model, test_loader, hypergraph_hie_aware_dict, device,
-                anchor_queue=anchor_queue, epoch=epoch)
+                anchor_queue=anchor_queue, epoch=self.configs["epochs"])
             print(
-                "epoch{}:\ttrain loss: {}\ttrain_sup loss: {}\ttrain_con loss: {}\ttrain_hse loss: {}\t"
-                "val_acc: {}\ttest_acc: {}"
-                .format(epoch, train_loss, train_loss_sup, train_loss_con, train_loss_se, val_acc, test_acc))
-            self._log_wandb_train(
-                epoch, exp_iter, train_loss, train_loss_sup, train_loss_con, train_loss_se)
-            self._log_wandb_eval(
-                epoch, exp_iter, val_acc, val_loss_sup, val_loss_se, val_loss_con)
-            self._log_wandb_test_epoch(
-                epoch, exp_iter, test_acc, test_loss_sup, test_loss_hse, test_loss_con)
-            if epoch > self.configs["warm_epochs"]:
-                epoch_select = self.configs["epoch_select"]
-                improved = False
-                score = 0.0
-                if epoch_select == 'val_loss_sup':
-                    if best_state is None or val_loss_sup < best_val_loss_sup:
-                        best_val_loss_sup = val_loss_sup
-                        improved = True
-                        score = val_loss_sup
-                elif epoch_select == 'val_acc':
-                    if best_state is None or val_acc > best_val_acc:
-                        best_val_acc = val_acc
-                        improved = True
-                        score = val_acc
-                elif epoch_select == 'val_acc_eq':
-                    if best_state is None or val_acc >= best_val_acc:
-                        best_val_acc = val_acc
-                        improved = True
-                        score = val_acc
-                elif epoch_select == 'val_loss_sup_hse':
-                    val_loss_sup_hse = val_loss_sup + val_loss_se
-                    if best_state is None or val_loss_sup_hse < best_val_loss_sup_se:
-                        best_val_loss_sup_se = val_loss_sup_hse
-                        improved = True
-                        score = val_loss_sup_hse
-                elif epoch_select == 'test_acc':
-                    if best_state is None or test_acc > best_test_acc_select:
-                        best_test_acc_select = test_acc
-                        improved = True
-                        score = test_acc
-                else:
-                    raise NotImplementedError(epoch_select)
+                "best_epoch:{}\ttest_acc:{}\ttest_loss_sup:{}\ttest_loss_con:{}\ttest_loss_hse:{}"
+                .format(best_epoch, test_acc, test_loss_sup, test_loss_con, test_loss_hse))
+            result = (test_acc, best_epoch, test_loss_sup, test_loss_hse, test_loss_con)
+        except (RuntimeError, torch.OutOfMemoryError) as err:
+            if "out of memory" in str(err).lower():
+                self._set_debug_ctx(phase="oom_cleanup")
+                self._release_cuda_memory()
+            raise
+        finally:
+            # Always release GPU-heavy references, including OOM/error paths.
+            self._set_debug_ctx(model=None, phase="done")
+            if isinstance(anchor_queue, list):
+                anchor_queue.clear()
+            cache = self._hg_dense_cache
+            if cache is not None:
+                cache.clear()
+            self._hg_dense_cache = None
+            del best_state, hypergraph_hie_aware_dict, dataset
+            del model, optimizer, lr_scheduler
+            del labeled_loader, unlabeled_loader, val_loader, test_loader
+            self._release_cuda_memory()
 
-                if improved:
-                    best_epoch = epoch
-                    best_state = deepcopy(model.state_dict())
-                    best_hypergraph_seed = current_hypergraph_seed
-                    print("epoch{}:\t{}={}".format(best_epoch, epoch_select, score))
-
-            if lr_scheduler is not None:
-                lr_scheduler.step()
-
-        if best_state is not None:
-            model.load_state_dict(best_state)
-            if best_hypergraph_seed is not None:
-                hypergraph_hie_aware_dict = self._load_hypergraphs(dataset, seed=best_hypergraph_seed)
-                self._hg_dense_cache.set_version(best_hypergraph_seed)
-                anchor_queue = self._init_anchor_queue(
-                    model, labeled_loader, hypergraph_hie_aware_dict, device)
-        test_acc, test_loss_sup, test_loss_hse, test_loss_con = self.evaluate(
-            model, test_loader, hypergraph_hie_aware_dict, device,
-            anchor_queue=anchor_queue, epoch=self.configs["epochs"])
-        print(
-            "best_epoch:{}\ttest_acc:{}\ttest_loss_sup:{}\ttest_loss_con:{}\ttest_loss_hse:{}"
-            .format(best_epoch, test_acc, test_loss_sup, test_loss_con, test_loss_hse))
-
-        # Release this run's GPU objects before the next seed starts. ``_debug_ctx``
-        # holds the model reference, so it must be cleared or the model (and its
-        # cached hypergraph tensors) survives every subsequent run in this trial.
-        self._set_debug_ctx(model=None, phase="done")
-        del model, optimizer, lr_scheduler, anchor_queue
-        del best_state, hypergraph_hie_aware_dict, dataset
-        del labeled_loader, unlabeled_loader, val_loader, test_loader
-        if getattr(self, '_hg_dense_cache', None) is not None:
-            self._hg_dense_cache.clear()
-        self._hg_dense_cache = None
-        self._release_cuda_memory()
-
-        return test_acc, best_epoch, test_loss_sup, test_loss_hse, test_loss_con
+        if result is None:
+            raise RuntimeError("run completed without producing test metrics")
+        return result
 
     @staticmethod
     def _release_cuda_memory():
@@ -587,12 +604,16 @@ class Exp:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
+            torch.cuda.ipc_collect()
 
     def cleanup(self):
         """Drop references held on the experiment so a sweep trial frees its GPU memory.
 
         Called by ``main`` in a ``finally`` block; safe to invoke after a failed run.
         """
+        if self._hg_dense_cache is not None:
+            self._hg_dense_cache.clear()
+            self._hg_dense_cache = None
         self._debug_ctx.clear()
         self.wandb = None
         self._release_cuda_memory()
