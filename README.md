@@ -43,7 +43,7 @@ SWEEP_NAME="${DATASET}_${SWEEP_TAG}"
 
 LOG_FILE="logs/sweep_${SWEEP_NAME}_$(date +%Y%m%d_%H%M%S).log"
 
-nohup /home/zengguangjie/anaconda3/envs/HEAL/bin/python -u main.py \
+CUDA_VISIBLE_DEVICES=0 nohup python -u main.py \
   --sweep \
   --data_name "${DATASET}" \
   --sweep_name "${SWEEP_NAME}" \

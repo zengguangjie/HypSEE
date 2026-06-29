@@ -19,6 +19,13 @@ def _default_aug_device(device: Optional[Union[torch.device, str]] = None) -> to
     return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
+def _ensure_num_nodes(data: BaseData) -> BaseData:
+    """Ensure num_nodes is stored explicitly for PyG batch collation."""
+    if data.x is not None:
+        data.num_nodes, _ = data.x.shape
+    return data
+
+
 def _cpu_adj_list(edge_index: torch.Tensor, num_nodes: int) -> list[list[int]]:
     """Build an adjacency list on CPU for subgraph sampling (NetworkX-free)."""
     adj: list[list[int]] = [[] for _ in range(num_nodes)]
@@ -239,15 +246,15 @@ def apply_augmentation(data, aug, aug_ratio, npower=1.0):
     if aug == "none":
         return data
     if aug == "wdropN":
-        return weighted_drop_nodes(data, aug_ratio, npower)
+        return _ensure_num_nodes(weighted_drop_nodes(data, aug_ratio, npower))
     if aug in _AUGMENTATIONS:
-        return _AUGMENTATIONS[aug](data, aug_ratio)
+        return _ensure_num_nodes(_AUGMENTATIONS[aug](data, aug_ratio))
     if aug in _RANDOM_AUGMENTATIONS:
         choices = _RANDOM_AUGMENTATIONS[aug]
         fn = choices[np.random.randint(len(choices))]
         if fn is weighted_drop_nodes:
-            return weighted_drop_nodes(data, aug_ratio, npower)
-        return fn(data, aug_ratio)
+            return _ensure_num_nodes(weighted_drop_nodes(data, aug_ratio, npower))
+        return _ensure_num_nodes(fn(data, aug_ratio))
     raise ValueError(f"unknown augmentation: {aug}")
 
 
