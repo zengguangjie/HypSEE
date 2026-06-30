@@ -114,7 +114,7 @@ SWEEP_SPEC: dict[str, Any] = {
         'feat_str': {
             'values': ['', 'deg', 'deg+odeg10', 'deg+odeg100', 'cent', 'ank1', 'deg+cent'],
         },
-        'batch_size': {'values': [32, 64, 80, 128, 256]},
+        'batch_size': {'values': [32, 64, 80, 128]},
         'num_anchors': {'values': [16, 32, 64, 128]},
         'num_edges2': {'values': [16, 32, 64, 128]},
     },

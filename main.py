@@ -200,6 +200,7 @@ def _release_cuda_memory():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+        torch.cuda.ipc_collect()
 
 
 def main(is_sweep=False):

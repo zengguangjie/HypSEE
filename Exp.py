@@ -14,7 +14,6 @@ from models.model import HypSEE
 from datasets.data_utils import (
     load_hypergraphs, hypergraph_to_dense_batch, precompute_hypergraphs,
     stratified_semi_supervised_split,
-    HypergraphDenseBatchCache,
 )
 import torch.nn.functional as F
 from copy import deepcopy
@@ -23,7 +22,6 @@ class Exp:
     def __init__(self, configs):
         self.configs = configs
         self._debug_ctx: dict[str, Any] = {}
-        self._hg_dense_cache: HypergraphDenseBatchCache | None = None
         self.wandb = None
         if configs.get("use_wandb"):
             import wandb
@@ -77,17 +75,31 @@ class Exp:
     def _is_finite(*tensors: torch.Tensor) -> bool:
         return all(torch.isfinite(t).all() for t in tensors)
 
+    @staticmethod
+    def _is_oom_error(err: BaseException) -> bool:
+        """True for CUDA OOM and generic RuntimeError wrappers (CPU / older PyTorch)."""
+        oom_type = getattr(torch.cuda, "OutOfMemoryError", None)
+        if oom_type is not None and isinstance(err, oom_type):
+            return True
+        return isinstance(err, RuntimeError) and "out of memory" in str(err).lower()
+
     def _optimizer_step(self, model, optimizer, loss):
         if not self._is_finite(loss):
             print(f"[warn] skip step: non-finite loss ({loss.item()})")
             optimizer.zero_grad(set_to_none=True)
             return False
 
-        loss.backward()
+        try:
+            loss.backward()
+        except RuntimeError as err:
+            if self._is_oom_error(err):
+                optimizer.zero_grad(set_to_none=True)
+            raise
         grad_clip = self.configs.get("grad_clip", 5.0)
         if grad_clip and grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
         return True
 
     def fix_seed(self, seed=0):
@@ -240,14 +252,12 @@ class Exp:
         )
 
     def _batch_hypergraph(self, batch, hypergraph_hie_aware_dict, device):
-        cache = getattr(self, '_hg_dense_cache', None)
         return hypergraph_to_dense_batch(
             hypergraph_dict=hypergraph_hie_aware_dict,
             graph_id_list=[int(gid) for gid in batch.graph_id.view(-1).tolist()],
             num_edges=self.configs['num_edges1'],
             device=device,
             dtype=batch.x.dtype,
-            cache=cache,
         )
 
     def _augment_views(self, batch, device, augment=True):
@@ -384,7 +394,7 @@ class Exp:
                 S_labeled, T_labeled, _, _, _ = model(labeled_data_S, labeled_data_T, labeled_H_S)
                 need = num_anchors - len(anchor_queue)
                 for i in range(min(S_labeled.shape[0], need)):
-                    anchor_queue.append((S_labeled[i], T_labeled[i]))
+                    anchor_queue.append((S_labeled[i].detach(), T_labeled[i].detach()))
             labeled_loader.new_epoch()
         assert len(anchor_queue) == num_anchors
         model.train()
@@ -481,15 +491,12 @@ class Exp:
             current_hypergraph_seed = None
             best_hypergraph_seed = None
 
-            self._hg_dense_cache = HypergraphDenseBatchCache()
-
             for epoch in range(1, self.configs["epochs"] + 1):
                 self._set_debug_ctx(epoch=epoch)
                 if self.configs['H1_update'] == 'epoch' or epoch == 1:
                     self._set_debug_ctx(phase="load_hypergraphs")
                     current_hypergraph_seed = seed + epoch
                     hypergraph_hie_aware_dict = self._load_hypergraphs(dataset, seed=current_hypergraph_seed)
-                    self._hg_dense_cache.set_version(current_hypergraph_seed)
 
                 if epoch == 1 or self.configs['H1_update'] == 'epoch':
                     assert hypergraph_hie_aware_dict is not None
@@ -565,7 +572,6 @@ class Exp:
                 model.load_state_dict(best_state)
                 if best_hypergraph_seed is not None:
                     hypergraph_hie_aware_dict = self._load_hypergraphs(dataset, seed=best_hypergraph_seed)
-                    self._hg_dense_cache.set_version(best_hypergraph_seed)
                     anchor_queue = self._init_anchor_queue(
                         model, labeled_loader, hypergraph_hie_aware_dict, device)
             test_acc, test_loss_sup, test_loss_hse, test_loss_con = self.evaluate(
@@ -575,28 +581,72 @@ class Exp:
                 "best_epoch:{}\ttest_acc:{}\ttest_loss_sup:{}\ttest_loss_con:{}\ttest_loss_hse:{}"
                 .format(best_epoch, test_acc, test_loss_sup, test_loss_con, test_loss_hse))
             result = (test_acc, best_epoch, test_loss_sup, test_loss_hse, test_loss_con)
-        except (RuntimeError, torch.OutOfMemoryError) as err:
-            if "out of memory" in str(err).lower():
-                self._set_debug_ctx(phase="oom_cleanup")
-                self._release_cuda_memory()
+        except RuntimeError as err:
+            if self._is_oom_error(err):
+                self._oom_cleanup(optimizer)
             raise
         finally:
-            # Always release GPU-heavy references, including OOM/error paths.
-            self._set_debug_ctx(model=None, phase="done")
-            if isinstance(anchor_queue, list):
-                anchor_queue.clear()
-            cache = self._hg_dense_cache
-            if cache is not None:
-                cache.clear()
-            self._hg_dense_cache = None
-            del best_state, hypergraph_hie_aware_dict, dataset
-            del model, optimizer, lr_scheduler
-            del labeled_loader, unlabeled_loader, val_loader, test_loader
-            self._release_cuda_memory()
+            self._run_finalize(
+                model=model,
+                optimizer=optimizer,
+                lr_scheduler=lr_scheduler,
+                anchor_queue=anchor_queue,
+                best_state=best_state,
+                hypergraph_hie_aware_dict=hypergraph_hie_aware_dict,
+                dataset=dataset,
+                labeled_loader=labeled_loader,
+                unlabeled_loader=unlabeled_loader,
+                val_loader=val_loader,
+                test_loader=test_loader,
+            )
 
         if result is None:
             raise RuntimeError("run completed without producing test metrics")
         return result
+
+    def _oom_cleanup(self, optimizer=None):
+        """Best-effort release after CUDA OOM before the exception propagates."""
+        self._set_debug_ctx(phase="oom_cleanup")
+        if optimizer is not None:
+            optimizer.zero_grad(set_to_none=True)
+        self._release_cuda_memory()
+
+    @staticmethod
+    def _clear_hyper_encoder_caches(model):
+        if model is None:
+            return
+        for attr in ("hyper_hierarchical_GRL", "hyper_hierarchical_GRL_S", "hyper_hierarchical_GRL_T"):
+            grl = getattr(model, attr, None)
+            if grl is not None:
+                grl.clu_mat.clear()
+                grl.vol_dict.clear()
+
+    def _run_finalize(
+        self,
+        *,
+        model,
+        optimizer,
+        lr_scheduler,
+        anchor_queue,
+        best_state,
+        hypergraph_hie_aware_dict,
+        dataset,
+        labeled_loader,
+        unlabeled_loader,
+        val_loader,
+        test_loader,
+    ):
+        """Release GPU-heavy references on every exit path (success, OOM, or other error)."""
+        self._set_debug_ctx(model=None, phase="done")
+        if optimizer is not None:
+            optimizer.zero_grad(set_to_none=True)
+        if isinstance(anchor_queue, list):
+            anchor_queue.clear()
+        self._clear_hyper_encoder_caches(model)
+        del best_state, hypergraph_hie_aware_dict, dataset
+        del model, optimizer, lr_scheduler
+        del labeled_loader, unlabeled_loader, val_loader, test_loader
+        self._release_cuda_memory()
 
     @staticmethod
     def _release_cuda_memory():
@@ -611,9 +661,6 @@ class Exp:
 
         Called by ``main`` in a ``finally`` block; safe to invoke after a failed run.
         """
-        if self._hg_dense_cache is not None:
-            self._hg_dense_cache.clear()
-            self._hg_dense_cache = None
         self._debug_ctx.clear()
         self.wandb = None
         self._release_cuda_memory()
@@ -634,8 +681,13 @@ class Exp:
         seed = int(self.configs.get("seed", 0))
         exp_iter = 0
         while len(test_acc_list) < self.configs["runs"]:
-            test_acc, best_epoch, test_loss_sup, test_loss_hse, test_loss_con = self.run(
-                seed, device, exp_iter=exp_iter)
+            try:
+                test_acc, best_epoch, test_loss_sup, test_loss_hse, test_loss_con = self.run(
+                    seed, device, exp_iter=exp_iter)
+            except RuntimeError as err:
+                if self._is_oom_error(err):
+                    self._release_cuda_memory()
+                raise
             print(f"run: {len(test_acc_list)}\tacc: {test_acc}")
             test_acc_list.append(test_acc)
             self._log_iter_metrics(
