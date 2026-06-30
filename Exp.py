@@ -83,6 +83,16 @@ class Exp:
             return True
         return isinstance(err, RuntimeError) and "out of memory" in str(err).lower()
 
+    @staticmethod
+    def _raise_oom_without_traceback(err: BaseException):
+        """Re-raise OOM without traceback frames that may retain large tensor locals."""
+        msg = str(err)
+        tb = err.__traceback__
+        if tb is not None:
+            traceback.clear_frames(tb)
+        oom_type = getattr(torch.cuda, "OutOfMemoryError", RuntimeError)
+        raise oom_type(msg) from None
+
     def _optimizer_step(self, model, optimizer, loss):
         if not self._is_finite(loss):
             print(f"[warn] skip step: non-finite loss ({loss.item()})")
@@ -94,6 +104,8 @@ class Exp:
         except RuntimeError as err:
             if self._is_oom_error(err):
                 optimizer.zero_grad(set_to_none=True)
+                self._release_cuda_memory()
+                self._raise_oom_without_traceback(err)
             raise
         grad_clip = self.configs.get("grad_clip", 5.0)
         if grad_clip and grad_clip > 0:
@@ -189,56 +201,81 @@ class Exp:
         total_unlabeled_graphs = 0
 
         for _ in range(num_steps):
-            labeled_batch = labeled_loader.next().to(device)
-            unlabeled_batch = unlabeled_loader.next().to(device)
-            num_labeled_graphs = labeled_batch.num_graphs
-            num_unlabeled_graphs = unlabeled_batch.num_graphs
+            labeled_batch = None
+            unlabeled_batch = None
+            labeled_H_S = None
+            unlabeled_H_S = None
+            labeled_data_S = labeled_data_T = None
+            unlabeled_data_S = unlabeled_data_T = None
+            S_labeled = T_labeled = out_labeled = None
+            S_unlabeled = T_unlabeled = None
+            S_anchors = T_anchors = None
+            loss_sup = loss_con = loss_hse = loss = None
+            try:
+                labeled_batch = labeled_loader.next().to(device)
+                unlabeled_batch = unlabeled_loader.next().to(device)
+                num_labeled_graphs = labeled_batch.num_graphs
+                num_unlabeled_graphs = unlabeled_batch.num_graphs
 
-            labeled_H_S = self._batch_hypergraph(labeled_batch, hypergraph_hie_aware_dict, device)
-            labeled_data_S, labeled_data_T = self._augment_views(labeled_batch, device)
-            optimizer.zero_grad()
+                labeled_H_S = self._batch_hypergraph(labeled_batch, hypergraph_hie_aware_dict, device)
+                labeled_data_S, labeled_data_T = self._augment_views(labeled_batch, device)
+                optimizer.zero_grad()
 
-            S_labeled, T_labeled, out_labeled, loss_hse_S_labeled, loss_hse_T_labeled = model(
-                labeled_data_S, labeled_data_T, labeled_H_S)
-            loss_sup = F.cross_entropy(out_labeled, labeled_batch.y)
+                S_labeled, T_labeled, out_labeled, loss_hse_S_labeled, loss_hse_T_labeled = model(
+                    labeled_data_S, labeled_data_T, labeled_H_S)
+                loss_sup = F.cross_entropy(out_labeled, labeled_batch.y)
 
-            unlabeled_H_S = self._batch_hypergraph(unlabeled_batch, hypergraph_hie_aware_dict, device)
-            unlabeled_data_S, unlabeled_data_T = self._augment_views(unlabeled_batch, device)
+                unlabeled_H_S = self._batch_hypergraph(unlabeled_batch, hypergraph_hie_aware_dict, device)
+                unlabeled_data_S, unlabeled_data_T = self._augment_views(unlabeled_batch, device)
 
-            def _compute_aux_losses():
-                S_unlabeled, T_unlabeled, _, loss_hse_S_unlabeled, loss_hse_T_unlabeled = model(
-                    unlabeled_data_S, unlabeled_data_T, unlabeled_H_S)
-                S_anchors = torch.stack([x[0] for x in anchor_queue])
-                T_anchors = torch.stack([x[1] for x in anchor_queue])
-                loss_con = model.loss_con(S_unlabeled, S_anchors, T_unlabeled, T_anchors)
-                hse_labeled_scale = num_labeled_graphs / max(num_unlabeled_graphs, 1)
-                loss_hse = (loss_hse_S_unlabeled + loss_hse_T_unlabeled
-                            + hse_labeled_scale * (loss_hse_S_labeled + loss_hse_T_labeled))
-                return loss_con, loss_hse
+                if warm:
+                    with torch.no_grad():
+                        S_unlabeled, T_unlabeled, _, loss_hse_S_unlabeled, loss_hse_T_unlabeled = model(
+                            unlabeled_data_S, unlabeled_data_T, unlabeled_H_S)
+                        S_anchors = torch.stack([x[0] for x in anchor_queue])
+                        T_anchors = torch.stack([x[1] for x in anchor_queue])
+                        loss_con = model.loss_con(S_unlabeled, S_anchors, T_unlabeled, T_anchors)
+                        hse_labeled_scale = num_labeled_graphs / max(num_unlabeled_graphs, 1)
+                        loss_hse = (loss_hse_S_unlabeled + loss_hse_T_unlabeled
+                                    + hse_labeled_scale * (loss_hse_S_labeled + loss_hse_T_labeled))
+                    loss = loss_sup
+                else:
+                    S_unlabeled, T_unlabeled, _, loss_hse_S_unlabeled, loss_hse_T_unlabeled = model(
+                        unlabeled_data_S, unlabeled_data_T, unlabeled_H_S)
+                    S_anchors = torch.stack([x[0] for x in anchor_queue])
+                    T_anchors = torch.stack([x[1] for x in anchor_queue])
+                    loss_con = model.loss_con(S_unlabeled, S_anchors, T_unlabeled, T_anchors)
+                    hse_labeled_scale = num_labeled_graphs / max(num_unlabeled_graphs, 1)
+                    loss_hse = (loss_hse_S_unlabeled + loss_hse_T_unlabeled
+                                + hse_labeled_scale * (loss_hse_S_labeled + loss_hse_T_labeled))
+                    loss = loss_sup + beta * loss_con + weight_hse * loss_hse
 
-            if warm:
-                with torch.no_grad():
-                    loss_con, loss_hse = _compute_aux_losses()
-                loss = loss_sup
-            else:
-                loss_con, loss_hse = _compute_aux_losses()
-                loss = loss_sup + beta * loss_con + weight_hse * loss_hse
+                total_loss_con += float(beta * loss_con) * num_unlabeled_graphs
+                total_loss_hse += float(weight_hse * loss_hse) * num_unlabeled_graphs
+                total_unlabeled_graphs += num_unlabeled_graphs
 
-            total_loss_con += float(beta * loss_con) * num_unlabeled_graphs
-            total_loss_hse += float(weight_hse * loss_hse) * num_unlabeled_graphs
-            total_unlabeled_graphs += num_unlabeled_graphs
+                if not self._optimizer_step(model, optimizer, loss):
+                    continue
 
-            if not self._optimizer_step(model, optimizer, loss):
-                continue
+                total_loss += float(loss)
+                total_loss_sup += float(loss_sup) * num_labeled_graphs
+                total_labeled_graphs += num_labeled_graphs
 
-            total_loss += float(loss)
-            total_loss_sup += float(loss_sup) * num_labeled_graphs
-            total_labeled_graphs += num_labeled_graphs
-
-            for i in range(num_labeled_graphs):
-                anchor_queue.append((S_labeled[i].detach(), T_labeled[i].detach()))
-                if len(anchor_queue) > self.configs["num_anchors"]:
-                    anchor_queue.pop(0)
+                for i in range(num_labeled_graphs):
+                    anchor_queue.append((S_labeled[i].detach(), T_labeled[i].detach()))
+                    if len(anchor_queue) > self.configs["num_anchors"]:
+                        anchor_queue.pop(0)
+            finally:
+                labeled_batch = None
+                unlabeled_batch = None
+                labeled_H_S = None
+                unlabeled_H_S = None
+                labeled_data_S = labeled_data_T = None
+                unlabeled_data_S = unlabeled_data_T = None
+                S_labeled = T_labeled = out_labeled = None
+                S_unlabeled = T_unlabeled = None
+                S_anchors = T_anchors = None
+                loss_sup = loss_con = loss_hse = loss = None
 
         if num_steps == 0:
             return 0.0, 0.0, 0.0, 0.0
@@ -584,6 +621,7 @@ class Exp:
         except RuntimeError as err:
             if self._is_oom_error(err):
                 self._oom_cleanup(optimizer)
+                self._raise_oom_without_traceback(err)
             raise
         finally:
             self._run_finalize(
@@ -687,6 +725,7 @@ class Exp:
             except RuntimeError as err:
                 if self._is_oom_error(err):
                     self._release_cuda_memory()
+                    self._raise_oom_without_traceback(err)
                 raise
             print(f"run: {len(test_acc_list)}\tacc: {test_acc}")
             test_acc_list.append(test_acc)
